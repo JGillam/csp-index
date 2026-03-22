@@ -14,7 +14,7 @@ This repository is in the proposal/RFC stage. The specification is open for comm
 
 ## Contributing
 
-Issues and pull requests are welcome. If you have feedback on the scoring model, category weights, or rubric definitions, please open an issue.
+Issues and pull requests are welcome. If you have feedback on the scoring model, category weights, or rubric definitions, please use the discussions tab.
 
 ## License
 
