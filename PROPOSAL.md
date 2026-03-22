@@ -408,7 +408,7 @@ Content-Security-Policy:
 | Style Injection | `style-src` | `'self'`, no unsafe-inline | 0.35 | 0.10 | 0.035 |
 | **Total** | | | | | **0.093** |
 
-**CSPit Index:** `1.0 + (0.093 × 9.0) = 1.84` → **1.8 / 10.0 (Low)**
+**CSP Index:** `1.0 + (0.093 × 9.0) = 1.84` → **1.8 / 10.0 (Low)**
 
 ---
 
@@ -429,7 +429,7 @@ Content-Security-Policy:
 | Style Injection | `default-src` | Active unsafe-inline | 0.65 | 0.10 | 0.065 |
 | **Total** | | | | | **0.880** |
 
-**CSPit Index:** `1.0 + (0.880 × 9.0) = 8.92` → **8.9 / 10.0 (Severe)**
+**CSP Index:** `1.0 + (0.880 × 9.0) = 8.92` → **8.9 / 10.0 (Severe)**
 
 ---
 
@@ -450,7 +450,7 @@ X-Frame-Options: DENY
 | Style Injection | Absent | 1.00 | none | 1.00 | 0.10 | 0.100 |
 | **Total** | | | | | | **0.940** |
 
-**CSPit Index:** `1.0 + (0.940 × 9.0) = 9.46` → **9.5 / 10.0 (Severe)**
+**CSP Index:** `1.0 + (0.940 × 9.0) = 9.46` → **9.5 / 10.0 (Severe)**
 
 The `X-Frame-Options` header meaningfully reduces clickjacking risk but has minimal effect on the aggregate index — a correct signal that the overall posture is still severely deficient.
 
