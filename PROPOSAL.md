@@ -1,7 +1,7 @@
-# CSP Index: A Risk-Based Index for Content Security Policies
+# CSP Index: Putting a Number on "Yes, We Have a CSP"
 
 > **Status:** Proposal / RFC
-> **Version:** 0.1.0
+> **Version:** 0.2.0
 > **Author:** Jason Gillam
 
 ---
@@ -9,584 +9,620 @@
 ## Table of Contents
 
 1. [Motivation](#1-motivation)
-2. [Design Goals](#2-design-goals)
-3. [Scoring Model Overview](#3-scoring-model-overview)
-4. [Directive Categories and Weights](#4-directive-categories-and-weights)
-5. [Per-Category Scoring Rubrics](#5-per-category-scoring-rubrics)
-6. [Directive Fallback Logic](#6-directive-fallback-logic)
-7. [Complementary Header Modifiers](#7-complementary-header-modifiers)
-8. [Aggregate Index Formula](#8-aggregate-index-formula)
+2. [What This Scores, and What It Does Not](#2-what-this-scores-and-what-it-does-not)
+3. [Design Goals](#3-design-goals)
+4. [The Seven Categories and Their Weights](#4-the-seven-categories-and-their-weights)
+5. [Resolving the Policy Before You Score It](#5-resolving-the-policy-before-you-score-it)
+6. [The Rubrics](#6-the-rubrics)
+7. [Other Headers as Modifiers](#7-other-headers-as-modifiers)
+8. [How the Number Gets Made](#8-how-the-number-gets-made)
 9. [Worked Examples](#9-worked-examples)
-10. [Edge Cases and Special Handling](#10-edge-cases-and-special-handling)
-11. [Open-Source Tooling](#11-open-source-tooling)
+10. [Leftover Edge Cases](#10-leftover-edge-cases)
+11. [Tooling](#11-tooling)
 12. [Limitations and Future Work](#12-limitations-and-future-work)
-13. [References](#13-references)
+13. [What Changed Since 0.1](#13-what-changed-since-01)
+14. [References](#14-references)
 
 ---
 
 ## 1. Motivation
 
-Content Security Policy (CSP) is one of the most powerful browser-enforced defenses against client-side attacks — but also one of the most frequently misconfigured. The current state of the art in CSP evaluation is largely binary: either a CSP header is present or it isn't. Tools like security scanners and header graders treat the existence of a CSP as a pass condition, with little or no differentiation between a policy like:
+On a fair number of the web application tests I run, the response headers include a `Content-Security-Policy`, and I have learned not to get my hopes up when I see one. More often than not the policy turns out to be something like `default-src 'self' 'unsafe-inline' 'unsafe-eval' https:`, which stops approximately nothing I care about. I can only guess at how it got there (my guess is usually that a scanner or an auditor said "add a CSP," and somebody did exactly that and no more), but the pattern is consistent: a nearly or completely useless CSP that could easily be doing so much more to protect the application. The XSS I find later in the test fires happily under it.
+
+Compare these two headers:
 
 ```
 Content-Security-Policy: script-src *; object-src *
 ```
 
-and:
-
 ```
-Content-Security-Policy: script-src 'nonce-r4nd0m' 'strict-dynamic'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
+Content-Security-Policy: script-src 'nonce-VOSYT20SImp81YScafJexg==' 'strict-dynamic';
+                         object-src 'none'; base-uri 'none'; form-action 'self';
+                         frame-ancestors 'none'
 ```
 
-These two policies represent radically different threat surfaces. The first offers essentially no XSS protection and is arguably worse than no CSP at all (because it creates a false sense of security). The second is close to optimal by current best-practice standards.
+A scanner that reports "CSP: present" treats those as the same result. They are not remotely the same result. The first one is no better than having no CSP at all, and it is arguably more annoying than having none, because a checkbox got ticked and everyone moved on. (I am not going to claim it is *worse* than no CSP. Under any sane model it cannot be, and I said otherwise in 0.1, which was sloppy.) The second one is close to what current best practice actually asks for.
 
-The goal of **CSP Index** is to replace this pass/fail model with a continuous, weighted **risk index from 1 to 10**, where:
+The other half of this comes from data collection. I have been gathering CSP headers at scale in a companion project, [csp-lab](https://github.com/JGillam/csp-lab), which started life as "experimenting with gathering CSP data / statistics" and grew a six-component classification framework in `docs/csp-component-classifications.md`. That framework was applied across a dataset of 750,000+ sites, and the first six of the seven categories in this document grew directly out of it. Once you have a few hundred thousand policies in a table, "present" and "absent" stop being useful columns and you start wanting a number you can sort on. [Placeholder: distribution findings from that dataset, once they are written up.]
 
-- **1** = minimal risk (policy is well-formed and restrictive across all meaningful attack surfaces)
-- **10** = maximum risk (no CSP, or a policy so permissive it provides no meaningful protection)
-
-This index is:
-- **Fully automatic** — computed from the raw CSP header string with no manual inputs
-- **Deterministic** — the same input always produces the same output
-- **Transparent** — every point contribution is traceable to a specific directive value
-- **Proportional** — categories are weighted by the relative impact of exploitation
-
-The scoring model draws from empirical research on CSP adoption and effectiveness, the W3C CSP Level 3 specification, and OWASP guidelines.
+So the goal here is a continuous, weighted **score from 0 to 10**, where higher is better. A 10.0 means the header is about as restrictive as a header can be. A 0.0 means there is no CSP, or there is one that may as well not be there. Everything in between is meant to be traceable back to a specific directive value, so that when the number drops, you can point at the line that did it.
 
 ---
 
-## 2. Design Goals
+## 2. What This Scores, and What It Does Not
 
-**Automatic and verifiable.** The scorer takes a raw `Content-Security-Policy` header string (and optionally a set of other HTTP response headers) and returns a numeric risk index. No human judgment is required.
+Let me scope this before anyone gets the wrong idea about what a 10.0 means.
 
-**Attack-surface proportionality.** Not all CSP directives protect against equally severe attacks. Script injection enables arbitrary code execution; style injection enables UI redressing. These categories carry different weights.
+The CSP Index scores **a header string**. It looks at the `Content-Security-Policy` header (plus a couple of complementary headers, see Section 7) and returns a number describing how much of the client-side attack surface that policy actually closes. That is the whole job.
 
-**Browser-accurate semantics.** Certain directive interactions change their effective meaning in browsers. For example, `'unsafe-inline'` is ignored by browsers when a valid nonce or hash is present in the same directive. The scorer must reflect actual browser behavior, not a naive keyword search.
+It does not score the site. A policy can earn a 9.5 and sit in front of an application riddled with stored XSS, SQL injection, and a broken authorization model, and the score will still say 9.5, because the score is telling you about the policy and not about the code behind it. It also cannot tell you whether the nonce you are looking at is freshly generated per request (though it makes one cheap attempt, see rule 8), whether an allowlisted CDN happens to host attacker-controllable JSONP, or whether the policy is even reachable on the pages that matter.
 
-**Graceful degradation.** A policy that protects 5 out of 6 attack categories should score significantly better than one that protects none. The scoring should not cliff-edge on a single missing directive.
+So the claim here is a narrow one: for the one specific question of how much of a policy's protective value is actually there, you should be able to get a repeatable number instead of a yes or a no.
 
-**Composable with other headers.** Certain HTTP response headers (e.g., `X-Frame-Options`) provide overlapping or complementary protections. These are acknowledged as index modifiers with clear limits, and must not fully substitute for the corresponding CSP directive.
-
----
-
-## 3. Scoring Model Overview
-
-The scoring model has three layers:
-
-```
-Raw CSP header string
-        │
-        ▼
-┌───────────────────────────────────────────────────┐
-│  Layer 1: Directive Parsing & Fallback Resolution │
-│  Resolve effective source lists per category,     │
-│  applying default-src fallback where applicable.  │
-└───────────────────────────────────────────────────┘
-        │
-        ▼
-┌───────────────────────────────────────────────────┐
-│  Layer 2: Per-Category Risk Scoring               │
-│  Each category receives a normalized risk score   │
-│  in [0.0, 1.0] based on a defined rubric.        │
-└───────────────────────────────────────────────────┘
-        │
-        ▼
-┌───────────────────────────────────────────────────┐
-│  Layer 3: Weighted Aggregation + Modifiers        │
-│  Weighted sum of category scores, adjusted by     │
-│  any applicable header modifiers, scaled to 1–10. │
-└───────────────────────────────────────────────────┘
-```
-
-The final index value is a floating-point number rounded to one decimal place, in the range [1.0, 10.0].
+One more scoping note: the CSP Index is deliberately **not** a remediation tool. It tells you where the risk is concentrated, and the category breakdown will point you at the directive, but it does not generate a suggested policy for you. That is a different tool, and Google's CSP Evaluator already does a decent job of it.
 
 ---
 
-## 4. Directive Categories and Weights
+## 3. Design Goals
 
-The scoring system covers six directive categories, each corresponding to a distinct attack surface. Weights reflect the relative exploitability and impact of weaknesses in that area.
+**Automatic and verifiable.** The scorer takes a raw header string (and optionally a few other response headers) and returns a number. No human judgment at scoring time, and no configuration knobs, because a knob is just a way for two people to get two different answers for the same header.
 
-| Category | Primary Directive(s) | Fallback | Weight | Attack Surface |
+**Attack-surface proportionality.** CSP directives do not protect against equally severe things. Script injection gets you arbitrary code execution in the user's session; style injection gets you a fairly constrained side channel and some UI redress. Those should not carry the same weight, and in this model they do not.
+
+**Browser-accurate semantics.** A surprising amount of CSP scoring in the wild is a keyword search, which is how you end up penalizing a policy for `'unsafe-inline'` that browsers are ignoring anyway because a nonce is present in the same directive. The scorer has to model what the browser does with the source list, not what the string looks like. Most of Section 5 exists because of this goal.
+
+**Graceful degradation, for six of the seven categories.** A policy that covers six attack surfaces and misses one should score noticeably better than a policy that covers none, and the weighted sum handles that. **Script execution is the deliberate exception.** It is allowed to cliff-edge, and it does, via the cap in Section 8. This was the single biggest correction from 0.1, where I said in prose that open script execution makes everything else academic and then built a formula that disagreed with me.
+
+**Composable with other headers, within limits.** A few response headers (`X-Frame-Options`, mainly) genuinely overlap with a CSP directive. Those are recognized as modifiers on a specific category value, they never apply when the CSP directive that supersedes them is present, and they cannot move the score on their own.
+
+---
+
+## 4. The Seven Categories and Their Weights
+
+Seven categories, each mapping to a distinct attack surface, with weights summing to 1.00.
+
+| Category | Primary directive(s) | Falls back to | Weight | Attack surface |
 |---|---|---|---|---|
-| **Script Execution** | `script-src` | `default-src` | 0.35 | Cross-site scripting (XSS); arbitrary JS execution |
-| **Object / Plugin Execution** | `object-src` | `default-src` | 0.15 | Flash/plugin-based code execution |
-| **Frame Embedding** | `frame-ancestors` | *(none)* | 0.15 | Clickjacking; UI redress attacks |
-| **Form Actions** | `form-action` | *(none)* | 0.15 | Credential exfiltration via form hijacking |
-| **Base URI** | `base-uri` | *(none)* | 0.10 | DOM base-tag injection; relative URL hijacking |
-| **Style Injection** | `style-src` | `default-src` | 0.10 | CSS injection; data exfiltration via side channel |
+| Script Execution | `script-src-elem`, `script-src-attr`, `script-src` | `default-src` | 0.40 | XSS; arbitrary JS in the user's session |
+| Object / Plugin | `object-src` | `default-src` | 0.05 | `<object>` / `<embed>` content, `data:` embedding |
+| Frame Embedding | `frame-ancestors` | *(none)* | 0.15 | Clickjacking and UI redress |
+| Form Actions | `form-action` | *(none)* | 0.15 | Credential exfiltration by form hijacking |
+| Base URI | `base-uri` | *(none)* | 0.10 | `<base>` injection; relative URL hijacking |
+| Style Injection | `style-src-elem`, `style-src-attr`, `style-src` | `default-src` | 0.10 | CSS injection, selector-based data leaks, UI redress |
+| Frame Content | `frame-src` | `child-src`, then `default-src` | 0.05 | Injected iframes; in-page phishing overlays |
 | **Total** | | | **1.00** | |
 
-### Rationale for Weights
+### Why these weights
 
-**Script Execution (0.35):** JavaScript injection is the predominant web attack vector. An unrestricted `script-src` renders all other CSP directives largely academic — an attacker with arbitrary JS execution can bypass form controls, read cookies, and exfiltrate data at will.
+**Script Execution (0.40).** This went up from 0.35 in 0.1, and honestly it could be argued higher still. JavaScript injection is the attack the whole mechanism was built to contain. If an attacker can run script in your origin, then your `form-action` is decorative (they can rewrite the form, or skip the form and post the credentials directly), your `base-uri` is decorative, and your `frame-ancestors` is beside the point because they are already inside. The weight is only half the story here; the cap in Section 8 does the heavy lifting. That is why the new Frame Content category is funded out of this weight (0.45 down to 0.40): with the cap in place, a nudge to the script weight changes very little, because for a bad script directive the cap is already what sets the number.
 
-**Object / Plugin Execution (0.15):** Browser plugins (Flash, Java, Silverlight) are now effectively extinct in modern browsers, but `object-src` still controls HTML `<object>` and `<embed>` elements. A missing or permissive `object-src` allows plugin-based code execution in legacy environments and data-URI embedding in modern ones. Its weight reflects declining relevance balanced against residual risk.
+**Object / Plugin (0.05).** Down hard from 0.15, and I expect this to be the least controversial change in the document. Flash is gone, Java applets are gone, Silverlight is gone. What is left is `<object>` and `<embed>` pointing at `data:` URLs and at documents that can carry script in some rendering paths, which is real but small. `object-src 'none'` remains part of every strict CSP recipe and it costs nothing, so I am keeping the category rather than dropping it: it is defense-in-depth and it is scored that way.
 
-**Frame Embedding (0.15):** The absence of `frame-ancestors` leaves a site open to clickjacking attacks, where an attacker overlays the target page in a transparent iframe to hijack user interactions. This is a well-understood, high-reliability attack class.
+**Frame Embedding (0.15).** Clickjacking is unglamorous, well understood, and still works. The thing that keeps this weight up is how frequently it is missed by accident: a site sets a tight `default-src` and assumes it is covered, and `frame-ancestors` does not fall back to `default-src`, so it is not covered at all.
 
-**Form Actions (0.15):** Without `form-action`, a page's forms can be hijacked to submit credentials to an attacker-controlled endpoint. This is especially relevant in the context of XSS — even if script injection is restricted, unrestricted form actions provide an alternative exfiltration path.
+**Form Actions (0.15).** Without `form-action`, an HTML injection that falls short of script execution can still repoint a login form at an attacker's endpoint. This is the directive that matters most exactly when your script controls held the line (i.e. the attacker got markup but not JavaScript), which is why it keeps a full 0.15 even though it looks minor next to XSS.
 
-**Base URI (0.10):** `base-uri` prevents attackers from injecting a `<base>` tag to redirect all relative URLs (including script sources) to an attacker-controlled domain. The risk is real but requires a pre-existing HTML injection primitive.
+**Base URI (0.10).** `base-uri` stops an injected `<base>` tag from redirecting every relative URL on the page, including script sources. The risk needs a pre-existing HTML injection primitive, so on its own it is conditional. There is an open question buried in this weight that I would like to make clear: `base-uri` matters *most* precisely when you are using nonces, because a `<base>` injection can retarget a nonced relative script source at an attacker host (CSP3 §7.3). A flat 0.10 cannot express "this is cheap insurance normally and load-bearing under `'strict-dynamic'`." A conditional weight is a candidate for 0.3.
 
-**Style Injection (0.10):** CSS injection can leak data via attribute selectors and timing attacks, and can be used to redress UI elements. However, CSS injection without JavaScript is a more limited attack channel, justifying a lower weight.
+**Style Injection (0.10).** CSS injection leaks data through attribute selectors and timing, and it redresses UI convincingly. It is a genuine attack channel and it is also a slower, noisier, more constrained one than script execution, which is what the 0.10 is expressing.
 
-> **Out of scope (v1):** `connect-src`, `img-src`, `media-src`, `worker-src`, `manifest-src`, and `navigate-to` are not scored in this version. These directives have meaningful security implications but are either lower-impact, less consistently deployed, or require more contextual knowledge to score accurately. They are candidates for future scoring categories.
+**Frame Content (0.05).** New in 0.2. An injected iframe is the cheapest phishing overlay there is: a lookalike login form sitting inside the page the user already trusts, at the URL they already checked, under the padlock they already looked at. It needs no script execution and no compromised host, only an HTML injection primitive, and where `data:` is an allowed source the iframe carries its own document and needs no external host at all. It gets 0.05 and no more because of containment: the injected frame is cross-origin from the page around it, so it cannot read the parent DOM, touch the session, or exfiltrate anything the user does not type into it by hand. I will say plainly that 0.1 had this pair backwards. It gave `object-src` a category worth 0.15 for a plugin ecosystem that has been dead for years, and it gave `frame-src` nothing at all for an attack that works today. 0.2 fixes that.
+
+> **What is not scored in 0.2.** The unscored directives are `connect-src`, `img-src`, `media-src`, `worker-src` and `manifest-src`. `connect-src` only starts to matter once an attacker already has script execution. `img-src`, `media-src` and `manifest-src` are hygiene. They are worth setting and the risk they carry is small enough that giving each one a weight would mostly add noise. `worker-src` is a real surface but a small one, and its chain (`worker-src` -> `child-src` -> `script-src` -> `default-src`) means a strict script policy usually covers it without anyone having to think about it. So in short, I didn't add the above in because I think they would needlessly complicate the scoring model. That could change as new attacks evolve, in which case we would rev the `model_version` (Section 8), and re-weight the directives.
 
 ---
 
-## 5. Per-Category Scoring Rubrics
+## 5. Resolving the Policy Before You Score It
 
-Each category returns a **normalized risk score** in **[0.0, 1.0]**, where 0.0 means no risk contribution and 1.0 means maximum risk. The rubric for each category is a decision tree evaluated against the effective source list for that directive.
+This section is Layer 1, and it is where most of the work is. Before any rubric runs, you have to turn "whatever arrived in the response headers" into one effective source list per category. Nearly every rule below is either new in 0.2 or a correction of something 0.1 got wrong, and several of them are places where a straightforward implementation gets the opposite of the spec's answer.
+
+**Rule 1. Only enforced policies are scored.** `Content-Security-Policy-Report-Only` enforces nothing; it reports. It is partitioned out before scoring and reported as a flag (`report_only_present`), never merged into the enforced policy. A site running a beautiful strict policy in report-only mode and nothing in enforcement mode scores exactly the same as a site with no CSP, because that is exactly the protection it has.
+
+**Rule 2. Multiple enforced policies are scored independently, then minimized per category.** Multiple `Content-Security-Policy` headers, or a comma-separated policy list inside one header value, produce multiple policies. CSP3 §8.1 says each is enforced independently and content must satisfy all of them, so the effective restriction is the strictest one. Score each policy on its own, then take the **per-category minimum** across policies. In 0.1 I said to use "the most restrictive value per directive," which sounds fine until you try to implement it: there is no defined way to intersect `script-src 'self' https://a.example` with `script-src 'nonce-...' 'strict-dynamic'`. Minimizing the *scores* is defined, and it is the closest honest approximation.
+
+**Rule 3. Within one policy, the first occurrence of a directive name wins.** If a policy contains `script-src 'self'; script-src *`, the effective value is `'self'` and the second one is ignored (CSP3 §2.2.1). This one matters because the obvious implementation gets it backwards: parse the policy into a dictionary with `directives[name] = value` and the *last* occurrence silently wins. That is also the basis of policy injection attacks, where an attacker who controls part of a reflected header appends a directive hoping to relax it. Under the spec they cannot relax an already-present directive, and the scorer needs to agree with the spec. (The PortSwigger policy injection technique works around this by adding a directive name that is *not* already present, e.g. `script-src-elem`, which is exactly why rule 5 resolves the `-elem` and `-attr` chains instead of stopping at `script-src`.)
+
+**Rule 4. Keyword matching is on whole quoted tokens, never substrings.** `'wasm-unsafe-eval'` contains the string `unsafe-eval` and is a completely different, much narrower keyword. A substring search penalizes it as though it were the real thing. Tokenize the source list on whitespace and compare whole tokens.
+
+**Rule 5. Use the spec's real fallback chains.** "Directive, else `default-src`" is not what CSP3 says. The chains that matter here:
+
+| Category | Chain |
+|---|---|
+| Script, element context | `script-src-elem` -> `script-src` -> `default-src` |
+| Script, attribute context | `script-src-attr` -> `script-src` -> `default-src` |
+| Style, element context | `style-src-elem` -> `style-src` -> `default-src` |
+| Style, attribute context | `style-src-attr` -> `style-src` -> `default-src` |
+| Object / Plugin | `object-src` -> `default-src` |
+| Frame Content | `frame-src` -> `child-src` -> `default-src` |
+| Frame Embedding | `frame-ancestors`, no fallback |
+| Form Actions | `form-action`, no fallback |
+| Base URI | `base-uri`, no fallback |
+
+Script Execution is scored as the **worse (lower) of the two resolved values**, element and attribute, and Style Injection likewise. The attribute context usually resolves to the same list as the element context, so most of the time this changes nothing; it exists for the policy that sets `script-src-elem 'nonce-...' 'strict-dynamic'` and leaves `script-src-attr` inheriting `'unsafe-inline'` from `default-src`, where inline event handlers still fire and the policy should not get full credit.
+
+The three no-fallback directives deserve their own sentence, because this is the single most common CSP misunderstanding I run into on tests: a strict `default-src` does not give you clickjacking protection, form hijacking protection, or `<base>` protection. Those three have to be written out explicitly or they are simply unset.
+
+**Rule 6. The `sandbox` directive is a precondition.** An enforced `sandbox` directive without `allow-scripts` means no script runs on that document at all, full stop, and Script, Object and Style are set to **0.98** regardless of what the source lists say. Without `allow-forms`, Form Actions is set to **0.98**. (I stopped short of 1.00 because sandbox is coarse enough that people get it wrong.) Set the `sandboxed` flag. Under 0.1's rubrics a fully sandboxed page with no other directives landed on that scale's worst possible result, which is about as wrong as this model can be.
+
+**Rule 7. The `'strict-dynamic'` keyword is a precondition, applied before scoring.** If the effective script directive contains `'strict-dynamic'` **and** a valid nonce or hash, then all host-source, scheme-source, `'self'` and `'unsafe-inline'` tokens are discarded from the list before any rubric row is considered (CSP3 §6.7.1.1 and §8.2). Browsers ignore them, so the scorer must too. This is not a hypothetical: the backward-compatible strict policy that the CSP3 spec and Google's own strict CSP guidance both recommend looks like `'nonce-...' 'strict-dynamic' 'unsafe-inline' https: http:`, and 0.1 scored it **0.95** because the `https:` token matched the wildcard row on the way down the first-match tree. The recommended policy scored almost as badly as no policy. That was the bug that convinced me 0.1 needed a structural fix rather than a tuning pass.
+
+**Rule 8. Nonce validity has a minimum, and there is a cheap check for static nonces.** A nonce counts as a nonce only if its base64 payload decodes to at least 16 bytes, per the CSP3 §7.1 SHOULD of at least 128 bits of entropy. Anything shorter is treated as no nonce at all and flagged `weak_nonce`. (0.1's worked example used `'nonce-abc123'`, which under 0.2 would be flagged. I am not proud of that.) Additionally, in `--url` mode the CLI fetches the page twice: if the nonce value is identical across both responses then it is effectively a password that ships with every page, so it is treated as no nonce and flagged `static_nonce`. Two fetches is not a rigorous randomness test and it will not catch a nonce that cycles through a small pool, but it catches the hardcoded case, which is the common one.
+
+**Rule 9. Meta-delivered CSP is not parsed in 0.2.** Policies delivered by `<meta http-equiv>` require fetching and parsing the document body, which puts this outside header-level analysis. If a future version does parse them, it must discard `frame-ancestors`, `sandbox` and `report-uri` from meta policies, because browsers ignore those in meta delivery (CSP3 §3.3), and crediting them would inflate the score for protections that are not actually in effect.
+
+**Rule 10. An `'unsafe-inline'` token is neutralized by a valid nonce or hash in the same directive.** This is unchanged from 0.1 in substance, but it now depends on rule 8: the neutralization only happens if the nonce is actually valid. `'unsafe-inline'` alongside a 4-byte nonce is active `'unsafe-inline'`.
 
 ### Terminology
 
-- **Effective directive:** The value actually evaluated for a given category, after applying fallback logic (see Section 6).
-- **Absent:** No effective directive is defined (neither the specific directive nor `default-src` covers it, where applicable).
-- **Wildcard source (`*`):** Matches any HTTP/HTTPS URL, effectively disabling the restriction.
-- **Active `'unsafe-inline'`:** `'unsafe-inline'` is present and *not* neutralized by a nonce or hash (see browser semantic note in Section 6).
-- **Nonce/hash protected:** At least one nonce (`'nonce-...'`) or hash (`'sha256-...'`, `'sha384-...'`, `'sha512-...'`) is present in the source list.
+- **Effective source list.** What is left for a category after rules 1 through 10 have run.
+- **Absent.** No effective directive covers the category, either because nothing in the chain is present or because the category has no fallback and its directive was not written.
+- **Active `'unsafe-inline'`.** `'unsafe-inline'` present and not neutralized by a valid nonce or hash.
+- **Valid nonce or hash.** A `'nonce-...'` whose payload decodes to at least 16 bytes and is not known-static, or a `'sha256-'` / `'sha384-'` / `'sha512-'` source.
+- **Host source.** An origin like `https://cdn.example.com`. **Scheme source** means a bare `https:`, `http:`, `data:` or `blob:`.
 
 ---
 
-### 5.1 Script Execution
+## 6. The Rubrics
 
-Evaluate `script-src` (fallback: `default-src`).
+Every category returns a protection value `p` in [0.00, 1.00], where 1.00 means the category is fully closed and 0.00 means it is fully exposed. All rubrics are evaluated against the effective source list from Section 5.
 
-| Condition | Risk Score |
+One rule applies to all seven tables: **these are not first-match decision trees.** You pick the row that describes the trust model of the source list, and where more than one row genuinely describes it, you take the **lowest-scoring** row. This matters for lists like `'self' 'unsafe-inline' https:`, where both the scheme-source row and the active-`'unsafe-inline'` row apply and the answer is the lower of the two.
+
+### 6.1 Script Execution
+
+The script rubric is a **base value plus deductions**, which is the other structural change in 0.2. The 0.1 version was a first-match tree, and it had two problems I could not tune my way out of. First, it had no row for `script-src 'none'`, so the correct answer for the most restrictive possible value was undefined and fell through to whatever the implementer felt like. Second, because the tree matched on one condition and stopped, `'strict-dynamic' 'nonce-...' 'unsafe-eval'` matched the "`'unsafe-eval'` only" row and landed at **0.55**, scoring a strict nonce policy with one legacy `eval()` dependency worse than a plain `'self'` allowlist. Separating the trust model from the specific relaxations fixes both.
+
+**Step 1.** Pick the one base-value row that describes the trust model of the effective source list, after rules 6 through 8 have been applied. If two rows describe it (e.g. `'self' 'unsafe-inline' https:` is both a scheme-source list and an active-`'unsafe-inline'` list), take the lower one. IMPORTANT: an implementation that walks the table top to bottom and stops at the first hit will get this wrong, and Example C shows exactly where.
+
+| Effective source list | Base `p` |
 |---|---|
-| Directive is absent | 1.00 |
-| Directive present with wildcard (`*`) source | 0.95 |
-| Directive present with `data:` or `blob:` scheme | 0.85 |
-| Active `'unsafe-inline'` + active `'unsafe-eval'` | 0.80 |
-| Active `'unsafe-inline'` (no nonce/hash, no `'unsafe-eval'`) | 0.70 |
-| `'unsafe-eval'` only (no `'unsafe-inline'`) | 0.55 |
-| Specific-domain allowlist, no nonce/hash, no unsafe directives | 0.45 |
-| Nonce/hash protected, no wildcards, no active unsafe directives | 0.20 |
-| `'strict-dynamic'` + nonce/hash, no active unsafe directives | 0.10 |
-| `'strict-dynamic'` + nonce/hash + `require-trusted-types-for 'script'` | 0.00 |
+| `'none'`, or an empty source list | 1.00 |
+| `'strict-dynamic'` with a valid nonce or hash | 0.90 |
+| Valid nonce or hash, no host or scheme sources, no `'strict-dynamic'` | 0.85 |
+| `'self'` only (no external hosts, no nonce) | 0.70 |
+| `'strict-dynamic'` with **no** valid nonce or hash | 0.65 |
+| Valid nonce or hash **plus** 1-2 external host origins, no `'strict-dynamic'` | 0.60 |
+| Valid nonce or hash **plus** 3+ external host origins, no `'strict-dynamic'` | 0.50 |
+| External host allowlist, 1-2 origins, no nonce (with or without `'self'`) | 0.50 |
+| External host allowlist, 3+ origins, no nonce (with or without `'self'`) | 0.40 |
+| Wildcard `*`, a scheme source (`https:`, `http:`), or `data:`, and not discarded by rule 7 | 0.10 |
+| Active `'unsafe-inline'` (no valid nonce or hash) | 0.05 |
+| Directive absent | 0.00 |
 
-**Note:** Rows are evaluated top-to-bottom; the first matching condition applies.
+A couple of those rows need defending.
 
-**Implementation note:** `'unsafe-inline'` is considered *active* only if no nonce or hash is present in the same directive. Per the CSP specification, browsers ignore `'unsafe-inline'` when a valid nonce or hash is present. Tools must implement this semantic to avoid penalizing policies that correctly use nonces alongside `'unsafe-inline'` for backward compatibility.
+`'strict-dynamic'` without a nonce or hash lands at 0.65, which is better than an allowlist. In 0.1 I described bare `'strict-dynamic'` as "meaningless," and that is not right: with no nonce and no hash there is nothing to propagate trust from, so every parser-inserted script is blocked, which is extremely restrictive. It also breaks most real sites, and it matched no row at all in 0.1's tree. 0.65 says "this is genuinely restrictive and you have almost certainly misconfigured it."
 
----
+The nonce-plus-hosts rows sit exactly 0.10 above their no-nonce equivalents, and that small gap is on purpose. Adding a nonce to an allowlist without adding `'strict-dynamic'` does not remove the allowlist; the CDN is still trusted and still the weak link. Weichselbaum et al. found that roughly three quarters of distinct policies with script allowlists were bypassable ("CSP Is Dead, Long Live CSP!", CCS 2016), and bolting a nonce onto one of those policies does not make the allowlisted host stop hosting the gadget. The nonce adds a safe path and closes nothing.
 
-### 5.2 Object / Plugin Execution
+**Step 2.** Subtract each of the following deductions that applies, then clamp the total at 0.00.
 
-Evaluate `object-src` (fallback: `default-src`).
-
-| Condition | Risk Score |
+| Token present in the effective list | Deduction |
 |---|---|
-| Directive is absent | 1.00 |
-| Directive present with wildcard (`*`) source | 0.90 |
-| Directive present with `data:` scheme | 0.75 |
-| Specific-domain allowlist (one or more external origins) | 0.35 |
-| `'self'` only | 0.15 |
-| `'none'` | 0.00 |
+| `'unsafe-eval'` | -0.15 |
+| `'unsafe-hashes'` | -0.10 |
+| `'wasm-unsafe-eval'` | -0.05 |
+| `blob:` | -0.10 |
 
----
+`blob:` gets a deduction rather than the 0.10 scheme-source row that `data:` gets, because the two are not equivalent. Minting a blob URL requires script that is already running, so `blob:` in `script-src` is a gadget amplifier that helps an attacker who already has execution. A `data:` URL can be written straight into injected markup, which makes it an injection primitive. Same family, different severity.
 
-### 5.3 Frame Embedding
-
-Evaluate `frame-ancestors`. **This directive does not fall back to `default-src`.**
-
-| Condition | Risk Score |
-|---|---|
-| `frame-ancestors` is absent | 1.00 |
-| `frame-ancestors *` (explicit wildcard) | 0.90 |
-| `frame-ancestors` with external origin allowlist (3+ entries) | 0.50 |
-| `frame-ancestors` with external origin allowlist (1–2 entries) | 0.30 |
-| `frame-ancestors 'self'` (possibly with one trusted origin) | 0.10 |
-| `frame-ancestors 'none'` | 0.00 |
-
----
-
-### 5.4 Form Actions
-
-Evaluate `form-action`. **This directive does not fall back to `default-src`.**
-
-| Condition | Risk Score |
-|---|---|
-| `form-action` is absent | 1.00 |
-| `form-action *` (explicit wildcard) | 0.90 |
-| `form-action` with external origin allowlist (3+ entries) | 0.50 |
-| `form-action` with external origin allowlist (1–2 entries) | 0.30 |
-| `form-action 'self'` (possibly with one trusted origin) | 0.05 |
-| `form-action 'none'` | 0.00 |
-
----
-
-### 5.5 Base URI
-
-Evaluate `base-uri`. **This directive does not fall back to `default-src`.**
-
-| Condition | Risk Score |
-|---|---|
-| `base-uri` is absent | 1.00 |
-| `base-uri *` (explicit wildcard) | 0.90 |
-| `base-uri` with external origin allowlist | 0.40 |
-| `base-uri 'self'` | 0.05 |
-| `base-uri 'none'` | 0.00 |
-
----
-
-### 5.6 Style Injection
-
-Evaluate `style-src` (fallback: `default-src`).
-
-| Condition | Risk Score |
-|---|---|
-| Directive is absent | 1.00 |
-| Directive present with wildcard (`*`) source | 0.90 |
-| Active `'unsafe-inline'` (no nonce/hash) | 0.65 |
-| Specific-domain allowlist, no nonce/hash, no `'unsafe-inline'` | 0.35 |
-| Nonce/hash protected, no wildcards, no active `'unsafe-inline'` | 0.10 |
-| `'none'` | 0.00 |
-
----
-
-## 6. Directive Fallback Logic
-
-The CSP specification defines `default-src` as a fallback for most fetch directives — but not all. This distinction is critical for accurate scoring.
-
-### Directives that fall back to `default-src`
-
-If the specific directive is absent, the scorer uses the `default-src` value as the effective directive:
-
-- `script-src`
-- `style-src`
-- `object-src`
-- `img-src`, `media-src`, `connect-src` (informational; not scored in v1)
-
-### Directives that do NOT fall back to `default-src`
-
-These directives are navigation/action controls, not fetch controls. If absent, they are simply unset — regardless of what `default-src` says:
-
-- `frame-ancestors`
-- `form-action`
-- `base-uri`
-- `navigate-to`
-
-This is a common source of misconfiguration: a site may have a strict `default-src` and believe it is protected against clickjacking, when in fact `frame-ancestors` must be explicitly specified.
-
-### Resolution algorithm
+**Step 3.** The Trusted Types modifier comes last. It closes a share of whatever exposure the directive still has:
 
 ```
-function effectiveDirective(csp, directiveName, hasFallback):
-    if directiveName in csp.directives:
-        return csp.directives[directiveName]
-    if hasFallback and 'default-src' in csp.directives:
-        return csp.directives['default-src']
-    return ABSENT
+p_script = p + 0.25 * (1 - p)     # require-trusted-types-for 'script'
+p_script = p + 0.35 * (1 - p)     # ...and a trusted-types allowlist directive as well
 ```
+
+So a script directive already sitting at 0.85 goes to 0.8875 with Trusted Types, and one sitting at 0.05 goes to 0.2875. The better your directive already is, the less there is left for Trusted Types to close, which is the behavior I want. This is applied to `p_script` before the cap in Section 8.
+
+Trusted Types was a rubric row worth full credit in 0.1, and that was too generous by a wide margin. It only covers DOM XSS sinks (`innerHTML`, `eval`, and friends). It does nothing about reflected or stored XSS that arrives in the server's response, which is still the bulk of what I find. Closing 25% to 35% of the remaining gap says what it deserves: a real, meaningful control that shuts one category of sink and leaves others open. The exact percentages are judgment, and I am open to argument on them.
+
+### 6.2 Object / Plugin
+
+Rows unchanged from 0.1 in substance; only the category weight moved and the direction flipped.
+
+| Effective source list | `p` |
+|---|---|
+| `'none'` | 1.00 |
+| `'self'` only | 0.85 |
+| External host allowlist | 0.65 |
+| `data:` | 0.25 |
+| Wildcard `*` or a scheme source | 0.10 |
+| Directive absent | 0.00 |
+
+### 6.3 Frame Embedding
+
+Evaluate `frame-ancestors`. No fallback.
+
+| Effective source list | `p` |
+|---|---|
+| `'none'` | 1.00 |
+| `'self'` only | 0.92 |
+| `'self'` plus exactly one external origin | 0.80 |
+| 1-2 external origins (no `'self'`) | 0.70 |
+| 3+ external origins | 0.50 |
+| `*` | 0.10 |
+| Directive absent | 0.00 |
+
+0.1 had a row reading "`'self'` (possibly with one trusted origin)" scored at 0.10, sitting *below* the 1-2 entries row in a first-match tree, which made it unreachable for anything but bare `'self'`. Splitting it into two explicit rows fixes that and puts a real, small cost on the partner origin you added for the support widget.
+
+### 6.4 Form Actions
+
+Evaluate `form-action`. No fallback. Same shape as frame embedding, because the structure of the risk is the same: every additional origin is another place your credentials can legally be posted.
+
+| Effective source list | `p` |
+|---|---|
+| `'none'` | 1.00 |
+| `'self'` only | 0.92 |
+| `'self'` plus exactly one external origin | 0.80 |
+| 1-2 external origins (no `'self'`) | 0.70 |
+| 3+ external origins | 0.50 |
+| `*` | 0.10 |
+| Directive absent | 0.00 |
+
+### 6.5 Base URI
+
+Evaluate `base-uri`. No fallback.
+
+| Effective source list | `p` |
+|---|---|
+| `'none'` | 1.00 |
+| `'self'` | 0.92 |
+| External host allowlist | 0.60 |
+| `*` | 0.10 |
+| Directive absent | 0.00 |
+
+There is almost never a legitimate reason to allow an external origin here, which is why the drop from 0.92 to 0.60 is so steep. See the open question about conditional weighting in Section 4.
+
+### 6.6 Style Injection
+
+Evaluate the style chain from rule 5, worse of element and attribute contexts. The same lowest-row rule applies here: `'unsafe-inline'` next to `https:` is scored as the scheme source (0.10), which is the lower of the two.
+
+| Effective source list | `p` |
+|---|---|
+| `'none'` | 1.00 |
+| Valid nonce or hash, no host sources, no active `'unsafe-inline'` | 0.95 |
+| `'self'` only | 0.90 |
+| External host allowlist, no active `'unsafe-inline'` | 0.65 |
+| Active `'unsafe-inline'` | 0.35 |
+| Wildcard `*` or a scheme source | 0.10 |
+| Directive absent | 0.00 |
+
+Deduction: `'unsafe-hashes'` subtracts 0.05, clamped at 0.00.
+
+Worth noting, since it trips people up: `style-src 'self' 'unsafe-inline'` is extremely common, because a lot of frameworks inject inline styles and nobody wants to hash them. It scores 0.35, which at a weight of 0.10 costs you 0.65 points against the 1.00 the category could have contributed. That is the model saying this is a real weakness and it is not the one to fix first.
+
+### 6.7 Frame Content
+
+Evaluate `frame-src`, falling back to `child-src` and then `default-src` per rule 5. This category is new in 0.2.
+
+| Effective source list | `p` |
+|---|---|
+| `'none'` | 1.00 |
+| `'self'` only | 0.90 |
+| `'self'` plus exactly one external origin | 0.80 |
+| 1-2 external origins (no `'self'`) | 0.70 |
+| 3+ external origins | 0.50 |
+| `data:` | 0.25 |
+| Wildcard `*` or a scheme source | 0.10 |
+| Directive absent | 0.00 |
+
+The shape follows the frame embedding and form action tables, because the risk grows the same way: every origin you allow is another party whose content can be made to appear inside your page. `data:` gets its own row for the same reason it gets one under `object-src`. An injected `<iframe src="data:text/html,...">` carries its own document in the attribute, so the attacker needs no host, no upload, and nothing on the network that you could have noticed.
+
+`'self'` sits at 0.90 here instead of the 0.92 used for frame embedding and form actions, which is a small deliberate difference: a same-origin iframe is a normal, useful thing that many applications genuinely need, and it is also a place where an open redirect or a user-content page on your own origin becomes a frame you did not intend.
 
 ---
 
-## 7. Complementary Header Modifiers
+## 7. Other Headers as Modifiers
 
-Several HTTP response headers provide security controls that overlap with specific CSP directives. The scorer acknowledges these modifiers as **risk reductions applied to specific category scores** — but with strict limits.
+A couple of response headers overlap with CSP directives. A modifier assigns a protection value to one specific category, and since the gate below means the category is sitting at 0.00 whenever a modifier can apply, an assignment is all that is needed. (0.1 gave two conflicting definitions for this, a cap on maximum contribution in prose and a proportional reduction in the formula. Both are gone.)
 
-The guiding principle is:
-
-> Modifier headers provide defense-in-depth, not a replacement for CSP. A missing CSP directive cannot be fully compensated by an alternative header. Modifiers apply a fractional risk reduction, capped at 40% of the category's maximum risk contribution.
-
-### Defined Modifiers
-
-| Header | Value(s) | Applies to Category | Max Risk Reduction |
+| Header | Value | Category | Sets `p` to |
 |---|---|---|---|
-| `X-Frame-Options` | `DENY` | Frame Embedding | 40% |
-| `X-Frame-Options` | `SAMEORIGIN` | Frame Embedding | 25% |
-| `Permissions-Policy` | any value | Style Injection | 5% |
+| `X-Frame-Options` | `DENY` | Frame Embedding | 0.80 |
+| `X-Frame-Options` | `SAMEORIGIN` | Frame Embedding | 0.60 |
 
-#### `X-Frame-Options: DENY` or `SAMEORIGIN`
+### X-Frame-Options
 
-`X-Frame-Options` is the legacy predecessor to `frame-ancestors` and is broadly supported. When `frame-ancestors` is absent and `X-Frame-Options: DENY` is present, clickjacking risk is meaningfully reduced. The 40% cap reflects that:
+**The gate condition is the important part.** `X-Frame-Options` is applied **only when no enforced policy contains a `frame-ancestors` directive at all.** In 0.1 the gate keyed off the category's own score instead, which is a different condition. That older gate would have credited a site running `frame-ancestors *` plus `X-Frame-Options: DENY`, and browsers ignore `X-Frame-Options` entirely when `frame-ancestors` is present (CSP3 §6.4.2.2), so the site's actual behavior is wide-open framing. The old rule would have rewarded it. If `frame-ancestors` is present in an enforced policy, in any form, the modifier does not apply.
 
-1. `X-Frame-Options` is not honored in all embedding contexts (e.g., `<object>` elements in some older browsers).
-2. It cannot express the full range of allowlists that `frame-ancestors` supports.
-3. Policies that rely solely on `X-Frame-Options` represent an outdated configuration.
+**The values are a judgment call, and a big change.** 0.1 allowed `DENY` to recover only 40% of what the missing directive cost, and justified that partly with "policies that rely solely on `X-Frame-Options` represent an outdated configuration." That is a statement about how current the configuration is, and this score is supposed to measure protection. For the actual attack, clickjacking, `X-Frame-Options: DENY` is functionally equivalent to `frame-ancestors 'none'` in every browser a real user is running. So the credit should be large, and 0.2 gives it 0.80 of the 1.00 that `frame-ancestors 'none'` would earn.
 
-When `frame-ancestors` is **already defined**, `X-Frame-Options` provides no additional score modifier — the CSP directive is authoritative in modern browsers, and the presence of a redundant header is irrelevant to risk.
+The 0.20 I am holding back is for deployment fragility: `X-Frame-Options` cannot be delivered by `<meta>` (so a page relying on it loses it in any context where headers are stripped or rewritten), and `SAMEORIGIN` ancestor-chain checking varied historically between browsers, with some checking only the top-level document rather than every ancestor. `SAMEORIGIN` gets 0.60 for that reason. I want to flag clearly that 0.80 and 0.60 are my judgment and someone will reasonably argue for 0.90 and 0.70, or for 0.60 and 0.40.
 
-#### `Permissions-Policy`
+### What happened to the Permissions-Policy modifier
 
-The `Permissions-Policy` header restricts access to browser APIs (camera, microphone, geolocation, etc.). Its relationship to CSP is indirect — it reduces the blast radius of a successful XSS by limiting what a script can do — but it does not constrain script execution itself. The 5% modifier reflects this marginal, indirect benefit.
+It is deleted. In 0.1, `Permissions-Policy` applied a 5% reduction to Style Injection, and I cannot reconstruct a defensible reason for that pairing: `Permissions-Policy` governs access to browser APIs like camera and geolocation, and has nothing to do with CSS injection. Even taking the pairing at face value, the maximum possible effect was 0.05 x 0.10 x 9 under 0.1's scale, which is 0.045 points, comfortably below the one-decimal reporting precision. It could never change a displayed score. Presence is now reported as a flag and nothing more.
 
-### Modifier Handling: The Double-Counting Problem
+### Why not more headers
 
-A key challenge with modifier headers is avoiding the inflation of protection credit. Consider a policy where:
-
-- `frame-ancestors` is absent → base risk score for Frame Embedding = 1.0
-- `X-Frame-Options: DENY` is present → modifier reduces this to 0.6
-
-The problem arises when a developer then adds `frame-ancestors 'none'` to the CSP. The frame risk drops to 0.0 from the rubric, and the `X-Frame-Options` modifier should no longer apply. The system handles this cleanly by rule:
-
-**Modifier reductions are only applied when the corresponding CSP directive falls back to an absent or permissive state.** Specifically:
-
-- If a category's rubric score is already ≤ 0.10 (i.e., the CSP directive is already doing its job), no modifier is applied.
-- If a category's rubric score is > 0.10, the modifier is applied to the rubric score, capped at 40% reduction.
-
-This ensures modifiers never inflate a score below what a correct CSP directive already achieves, and never mask the absence of a directive entirely.
-
-### Why Not More Modifiers?
-
-Headers like `X-Content-Type-Options: nosniff`, `Referrer-Policy`, and `Strict-Transport-Security` are general security hygiene but have minimal bearing on CSP-specific risk. Including them here would dilute the CSP-specific signal of the index. These headers are better evaluated by a general HTTP security header scorer (such as securityheaders.com) that operates alongside CSP Index.
+`X-Content-Type-Options: nosniff`, `Strict-Transport-Security`, and `Referrer-Policy` are all worth having and none of them change the answer to "how much client-side attack surface does this policy leave open." Folding them in would dilute the CSP-specific signal and turn this into a worse version of a general header grader, which already exists and which you should also run.
 
 ---
 
-## 8. Aggregate Index Formula
+## 8. How the Number Gets Made
 
-### Step 1: Compute per-category raw risk scores
+**Step 1.** Resolve the seven effective source lists per Section 5.
 
-For each of the six categories, apply the relevant rubric to get a raw risk score `r_i ∈ [0.0, 1.0]`.
+**Step 2.** Apply the rubrics from Section 6 to get protection values `p_i` in [0.00, 1.00].
 
-### Step 2: Apply modifier adjustments
-
-For each category where a modifier applies and the raw score > 0.10:
+**Step 3.** Apply the Trusted Types modifier to `p_script`, and the `X-Frame-Options` modifier to `p_frame` if its gate condition is met.
 
 ```
-r_i_adjusted = r_i × (1 - min(modifier_reduction, 0.40))
+p_script = max(base - deductions, 0.00)
+p_script = p_script + tt_share * (1 - p_script)    # tt_share is 0.25 or 0.35
+p_frame  = xfo_value                                # only if no enforced frame-ancestors
 ```
 
-### Step 3: Compute weighted sum
+**Step 4.** Compute the weighted sum.
 
 ```
-weighted_sum = Σ (w_i × r_i_adjusted)
+weighted = SUM( w_i * p_i )     for the seven categories, SUM(w_i) = 1.00
 ```
 
-Where `w_i` are the category weights defined in Section 4 and sum to 1.0.
-
-### Step 4: Scale to [1.0, 10.0]
+**Step 5.** Apply the script cap and scale.
 
 ```
-risk_index = 1.0 + (weighted_sum × 9.0)
+csp_score = 10.0 * min(weighted, p_script)
 ```
 
-This maps `weighted_sum = 0.0` (all categories perfectly protected) to a final index of **1.0**, and `weighted_sum = 1.0` (all categories maximally risky) to a final index of **10.0**.
+**Step 6.** Round to one decimal place. The result runs from 0.0 to 10.0.
 
-### Step 5: Round
+### The cap, in plain English
 
-The final index is reported to one decimal place:
+Your score can never be higher than your `script-src`. That is the whole rule, and it is the most important change in 0.2. Section 4 of 0.1 said, correctly, that open script execution makes every other directive academic, and then the formula went ahead and averaged it away: a policy with no `script-src` at all but perfect values everywhere else came out in the comfortable middle of 0.1's range and got a reassuring label. A site where an attacker can run arbitrary JavaScript in your users' sessions has not earned a middling result. Under the cap that policy scores **0.0**, because that is what its script directive is worth and nothing else can lift it.
 
-```
-final_index = round(risk_index, 1)
-```
+Two consequences worth stating out loud. Once the cap is what binds, improvements to the other six categories stop moving the number, which is intentional: if your script directive is absent, tightening `base-uri` is not the work. When the weighted sum is the lower of the two, it does the talking and all seven categories matter normally. Example B in the next section is a policy that has fixed its script problem completely and still lands in the Weak band, which is exactly the behavior I wanted.
 
-### Index Interpretation Table
+### Bands
 
-| Index Range | Risk Level | Interpretation |
+| Score | Rating | What it means |
 |---|---|---|
-| 1.0 – 2.5 | Low | Strong, restrictive CSP. Minor improvements possible. |
-| 2.6 – 4.5 | Moderate | Meaningful protections in place but notable gaps exist. |
-| 4.6 – 6.5 | High | Significant weaknesses; several attack surfaces exposed. |
-| 6.6 – 8.5 | Critical | CSP provides little practical protection; likely a checkbox policy. |
-| 8.6 – 10.0 | Severe | No CSP, or a policy so permissive it is effectively absent. |
+| 8.5 - 10.0 | Strong | Restrictive policy; little left to tighten. |
+| 6.5 - 8.4 | Moderate | Real protection with a gap or two worth closing. |
+| 4.0 - 6.4 | Weak | Several attack surfaces left open. |
+| 1.5 - 3.9 | Poor | Little practical protection; probably a checkbox policy. |
+| 0.0 - 1.4 | Negligible | No CSP, or one that may as well not be there. |
+
+### Output contract
+
+JSON output carries `csp_score`, always carries `rating` even when a caller only asked for the number, and always carries `model_version`. Higher is better, on a 0.0 to 10.0 scale, and 0.0 covers both "no CSP" and "a policy that stops nothing." How a tool chooses to show the difference between those two (a dash, the word "none", a separate flag) is the tool's business and outside this calculator.
+
+`model_version` is not bookkeeping: the scores in this document will change between versions, so a CI gate written as `--min-score 7.5` has to be pinned to a model version or your build breaks on an upgrade for reasons that have nothing to do with your code. The CLI requires the pin.
 
 ---
 
 ## 9. Worked Examples
 
-### Example A: Modern Nonce-Based Policy
+All four are computed by hand below. If you get a different number, that is a bug in this document and I would like to hear about it.
+
+### Example A: a full nonce-based policy
 
 ```
 Content-Security-Policy:
-  script-src 'nonce-abc123' 'strict-dynamic';
+  script-src 'nonce-VOSYT20SImp81YScafJexg==' 'strict-dynamic';
   object-src 'none';
   style-src 'self';
+  frame-src 'self';
   frame-ancestors 'self';
   form-action 'self';
   base-uri 'none'
 ```
 
-| Category | Effective Directive | Condition | Score | Weight | Contribution |
+| Category | Effective value | Rubric row | p_i | w_i | w_i x p_i |
 |---|---|---|---|---|---|
-| Script Execution | `script-src` | strict-dynamic + nonce, no unsafe | 0.10 | 0.35 | 0.035 |
-| Object/Plugin | `object-src` | `'none'` | 0.00 | 0.15 | 0.000 |
-| Frame Embedding | `frame-ancestors` | `'self'` | 0.10 | 0.15 | 0.015 |
-| Form Actions | `form-action` | `'self'` | 0.05 | 0.15 | 0.008 |
-| Base URI | `base-uri` | `'none'` | 0.00 | 0.10 | 0.000 |
-| Style Injection | `style-src` | `'self'`, no unsafe-inline | 0.35 | 0.10 | 0.035 |
-| **Total** | | | | | **0.093** |
+| Script Execution | nonce + `'strict-dynamic'` | strict-dynamic with valid nonce | 0.90 | 0.40 | 0.360 |
+| Object / Plugin | `'none'` | `'none'` | 1.00 | 0.05 | 0.050 |
+| Frame Embedding | `'self'` | `'self'` only | 0.92 | 0.15 | 0.138 |
+| Form Actions | `'self'` | `'self'` only | 0.92 | 0.15 | 0.138 |
+| Base URI | `'none'` | `'none'` | 1.00 | 0.10 | 0.100 |
+| Style Injection | `'self'` | `'self'` only | 0.90 | 0.10 | 0.090 |
+| Frame Content | `'self'` | `'self'` only | 0.90 | 0.05 | 0.045 |
+| **weighted** | | | | | **0.921** |
 
-**CSP Index:** `1.0 + (0.093 × 9.0) = 1.84` → **1.8 / 10.0 (Low)**
+```
+csp_score = 10.0 * min(0.921, 0.90)
+          = 10.0 * 0.90
+          = 9.0
+```
 
----
+**9.0 / 10.0 (Strong).** Note which number won the `min()`: the weighted sum is 0.921, but the script value of 0.90 is lower, so the cap binds and the script directive sets the score single-handedly. That is the intended reading of this policy. Everything else in it is better than the script directive, so the script directive is the answer. The nonce here is a real 128-bit value, which matters under rule 8: swap in `'nonce-abc123'` and the policy is scored as having no nonce at all, which knocks out the `'strict-dynamic'` precondition and puts you somewhere entirely different.
 
-### Example B: Checkbox CSP (Common Misconfiguration)
+### Example B: Google's recommended backward-compatible strict CSP
 
 ```
 Content-Security-Policy:
-  default-src 'self' 'unsafe-inline' 'unsafe-eval' https:
+  script-src 'nonce-AAPYI1KqZa5DErkp38/t6A==' 'strict-dynamic' 'unsafe-inline' https: http:;
+  object-src 'none';
+  base-uri 'none'
 ```
 
-| Category | Effective Directive | Condition | Score | Weight | Contribution |
+Rule 7 fires first: `'strict-dynamic'` plus a valid nonce discards `'unsafe-inline'`, `https:` and `http:` before scoring, leaving `'nonce-...' 'strict-dynamic'`.
+
+| Category | Effective value | Rubric row | p_i | w_i | w_i x p_i |
 |---|---|---|---|---|---|
-| Script Execution | `default-src` | unsafe-inline + unsafe-eval | 0.80 | 0.35 | 0.280 |
-| Object/Plugin | `default-src` | External HTTPS origins via `https:` wildcard | 0.90 | 0.15 | 0.135 |
-| Frame Embedding | absent | Not defined; no fallback | 1.00 | 0.15 | 0.150 |
-| Form Actions | absent | Not defined; no fallback | 1.00 | 0.15 | 0.150 |
-| Base URI | absent | Not defined; no fallback | 1.00 | 0.10 | 0.100 |
-| Style Injection | `default-src` | Active unsafe-inline | 0.65 | 0.10 | 0.065 |
-| **Total** | | | | | **0.880** |
-
-**CSP Index:** `1.0 + (0.880 × 9.0) = 8.92` → **8.9 / 10.0 (Severe)**
-
----
-
-### Example C: Absent CSP with X-Frame-Options
+| Script Execution | nonce + `'strict-dynamic'` (rest discarded) | strict-dynamic with valid nonce | 0.90 | 0.40 | 0.360 |
+| Object / Plugin | `'none'` | `'none'` | 1.00 | 0.05 | 0.050 |
+| Frame Embedding | absent | absent | 0.00 | 0.15 | 0.000 |
+| Form Actions | absent | absent | 0.00 | 0.15 | 0.000 |
+| Base URI | `'none'` | `'none'` | 1.00 | 0.10 | 0.100 |
+| Style Injection | absent | absent | 0.00 | 0.10 | 0.000 |
+| Frame Content | absent (no `default-src` to inherit) | absent | 0.00 | 0.05 | 0.000 |
+| **weighted** | | | | | **0.510** |
 
 ```
-(No CSP header present)
+csp_score = 10.0 * min(0.510, 0.90)
+          = 10.0 * 0.510
+          = 5.1
+```
+
+**5.1 / 10.0 (Weak).** This is the example I would point at first. The policy is the spec's own recommended recipe for strict CSP with backward compatibility, and it has genuinely solved the script problem: 0.90, the same value as Example A, because rule 7 correctly throws away the compatibility tokens. Version 0.1 scored this exact policy one rung above "no policy at all" on script, which was flatly wrong.
+
+But solving XSS is not the whole job, and this policy does nothing else. No `frame-ancestors`, so it can be framed. No `form-action`, so a markup injection can repoint the login form. No `style-src`, so CSS injection is unconstrained. No `frame-src` and no `default-src` for it to inherit, so an injected iframe can pull in anything it likes. Four categories sitting at 0.00 is what holds a policy with an excellent script directive down in the Weak band, and I think that is the right answer: the strict-CSP recipe is the hard part, it is done, and there are four one-line directives left to add that would take this to 9.0 (weighted 0.921, capped by the script value of 0.90).
+
+### Example C: the checkbox policy
+
+```
+Content-Security-Policy: default-src 'self' 'unsafe-inline' 'unsafe-eval' https:
+```
+
+Every category with a fallback resolves through `default-src`. There is no nonce, so `'unsafe-inline'` is active. For script, both the scheme-source row (0.10) and the active-`'unsafe-inline'` row (0.05) describe the list, so the lower one wins, then `'unsafe-eval'` takes off 0.15 and the total clamps at 0.00. Style works the same way: `'unsafe-inline'` is 0.35 and the `https:` scheme source is 0.10, so 0.10.
+
+| Category | Effective value | Rubric row | p_i | w_i | w_i x p_i |
+|---|---|---|---|---|---|
+| Script Execution | via `default-src` | active `'unsafe-inline'` 0.05, `-0.15` eval, clamped | 0.00 | 0.40 | 0.000 |
+| Object / Plugin | via `default-src` | scheme source `https:` | 0.10 | 0.05 | 0.005 |
+| Frame Embedding | absent (no fallback) | absent | 0.00 | 0.15 | 0.000 |
+| Form Actions | absent (no fallback) | absent | 0.00 | 0.15 | 0.000 |
+| Base URI | absent (no fallback) | absent | 0.00 | 0.10 | 0.000 |
+| Style Injection | via `default-src` | scheme source `https:` | 0.10 | 0.10 | 0.010 |
+| Frame Content | via `default-src` | scheme source `https:` | 0.10 | 0.05 | 0.005 |
+| **weighted** | | | | | **0.020** |
+
+```
+csp_score = 10.0 * min(0.020, 0.00)
+          = 10.0 * 0.00
+          = 0.0
+```
+
+**0.0 / 10.0 (Negligible).** This is the policy from the top of the document, and it is the one I find most often in the wild. It ties with having no CSP header whatsoever, which is the honest answer: with `'unsafe-inline'` and `'unsafe-eval'` active and `https:` as a source, there is no injected script this policy stops. Someone will object that surely a present-but-useless policy should rank slightly above nothing at all, on the theory that partial credit encourages progress. I do not agree. There is no attack it prevents, so there is no credit to give, and a scoring system that awards points for a header that does nothing is how we got the pass/fail scanners in the first place.
+
+### Example D: no CSP, with X-Frame-Options
+
+```
+(no Content-Security-Policy header)
 X-Frame-Options: DENY
 ```
 
-| Category | Condition | Score | Modifier | Adjusted | Weight | Contribution |
-|---|---|---|---|---|---|---|
-| Script Execution | Absent | 1.00 | none | 1.00 | 0.35 | 0.350 |
-| Object/Plugin | Absent | 1.00 | none | 1.00 | 0.15 | 0.150 |
-| Frame Embedding | Absent | 1.00 | X-Frame-Options: DENY (−40%) | 0.60 | 0.15 | 0.090 |
-| Form Actions | Absent | 1.00 | none | 1.00 | 0.15 | 0.150 |
-| Base URI | Absent | 1.00 | none | 1.00 | 0.10 | 0.100 |
-| Style Injection | Absent | 1.00 | none | 1.00 | 0.10 | 0.100 |
-| **Total** | | | | | | **0.940** |
+No enforced policy means no `frame-ancestors` anywhere, so the modifier gate in Section 7 opens and Frame Embedding is set to 0.80.
 
-**CSP Index:** `1.0 + (0.940 × 9.0) = 9.46` → **9.5 / 10.0 (Severe)**
+| Category | Effective value | Rubric row | p_i (raw) | Modifier | p_i | w_i | w_i x p_i |
+|---|---|---|---|---|---|---|---|
+| Script Execution | absent | absent | 0.00 | none | 0.00 | 0.40 | 0.000 |
+| Object / Plugin | absent | absent | 0.00 | none | 0.00 | 0.05 | 0.000 |
+| Frame Embedding | absent | absent | 0.00 | XFO DENY, set to 0.80 | 0.80 | 0.15 | 0.120 |
+| Form Actions | absent | absent | 0.00 | none | 0.00 | 0.15 | 0.000 |
+| Base URI | absent | absent | 0.00 | none | 0.00 | 0.10 | 0.000 |
+| Style Injection | absent | absent | 0.00 | none | 0.00 | 0.10 | 0.000 |
+| Frame Content | absent | absent | 0.00 | none | 0.00 | 0.05 | 0.000 |
+| **weighted** | | | | | | | **0.120** |
 
-The `X-Frame-Options` header meaningfully reduces clickjacking risk but has minimal effect on the aggregate index — a correct signal that the overall posture is still severely deficient.
+```
+csp_score = 10.0 * min(0.120, 0.00)
+          = 10.0 * 0.00
+          = 0.0
+```
 
----
-
-## 10. Edge Cases and Special Handling
-
-### No CSP header present
-
-All categories are treated as absent. The index will typically fall between 9.0 and 10.0, depending on modifier headers present.
-
-### CSP-Report-Only
-
-`Content-Security-Policy-Report-Only` does not enforce any restrictions in the browser — it only reports violations. A site with only a `Report-Only` policy has no active CSP protection. The scorer must treat `Report-Only` as absent for scoring purposes, though it may note the presence of a reporting policy separately.
-
-### Multiple CSP headers
-
-Per the CSP specification, when multiple `Content-Security-Policy` headers are present, the browser applies the intersection of all policies (i.e., the most restrictive across all headers). The scorer should parse all present CSP headers and use the most restrictive effective value per directive.
-
-### `'nonce-'` token validity
-
-The scorer does not validate nonce randomness or length beyond confirming the presence of the `'nonce-'` prefix. Per-request nonce generation is a deployment concern, not a syntactic one. Static nonces (i.e., the same value in every response) do represent a real weakening, but detection requires dynamic analysis outside the scope of a header-based scorer.
-
-### `'unsafe-inline'` neutralization by nonce/hash
-
-Per the CSP Level 3 specification:
-
-> If a policy contains a `nonce-source` or `hash-source`, the `'unsafe-inline'` keyword is ignored.
-
-The scorer must implement this semantic. The presence of `'nonce-abc123'` in `script-src` means that `'unsafe-inline'` — if also present — is **not active** and should not trigger the unsafe-inline penalty.
-
-### `'strict-dynamic'`
-
-When `'strict-dynamic'` is present, the browser ignores both origin allowlists and `'unsafe-inline'` in favor of nonce/hash trust propagation. The scorer should recognize `'strict-dynamic'` as an upgrade from allowlist-based CSP, but only credit it when a nonce or hash is also present (otherwise `'strict-dynamic'` alone is meaningless).
-
-### Scheme-only sources (`https:`, `http:`, `data:`, `blob:`)
-
-`https:` as a source is nearly as permissive as `*` for `script-src` — it allows loading scripts from any HTTPS URL. The scorer should treat `https:` as equivalent to a wildcard for script and object sources. The `data:` and `blob:` schemes are particularly dangerous in `script-src` as they enable inline script execution via data URIs.
+**0.0 / 10.0 (Negligible).** The `X-Frame-Options` header does real work here and you can see it doing that work: Frame Embedding shows 0.80 instead of 0.00 in the category breakdown, the modifier is listed in the output, and the weighted sum comes to 0.120 instead of 0.000. And the score does not move, because the script cap is sitting at 0.00 and no amount of clickjacking protection changes the fact that there is no CSP. This is the cap behaving correctly, and the credit for the header shows up in the breakdown, which is where it belongs.
 
 ---
 
-## 11. Open-Source Tooling
+## 10. Leftover Edge Cases
 
-### Reference Implementation
+Most of what was in this section in 0.1 became actual resolution rules in Section 5, which is where it belonged. What is left:
 
-The reference implementation (to be co-located in this repository) will provide:
+**No headers at all.** Every category is absent, every raw value is 0.00, and the score is 0.0. With a modifier header present the weighted sum rises a little, but the script cap keeps the score pinned at 0.0, as in Example D.
 
-- A Python library (`csp_index`) with a single primary interface:
-  ```python
-  from csp_index import compute_index
+**Malformed or unparseable policies.** A directive name the parser does not recognize is ignored (CSP3 requires browsers to ignore unknown directives, so the scorer does too) and reported in a flag. A policy that is entirely unparseable is scored as absent, with a flag, on the grounds that a browser will not get anything useful out of it either.
 
-  result = compute_index(
-      csp_header="script-src 'nonce-abc' 'strict-dynamic'; object-src 'none'; ...",
-      other_headers={
-          "X-Frame-Options": "DENY"
-      }
-  )
+**Scheme sources in general.** `https:` in `script-src` allows script from any HTTPS origin on the internet, which is a wildcard wearing a tie. It scores as one. `data:` is worse in practice than its row suggests, because a `data:` URL in `script-src` means injected markup can carry its own payload with no external fetch at all, and the only reason it does not score below `'unsafe-inline'` is that it still needs a tag to be injected.
 
-  print(result.index)          # 2.1
-  print(result.risk_level)     # "Low"
-  print(result.category_scores)  # {"script_execution": 0.10, ...}
-  print(result.modifiers_applied)  # [{"header": "X-Frame-Options", ...}]
-  ```
+**Report-only policies alongside enforced ones.** Scored per rule 1: only the enforced policy counts, and the report-only one is a flag. This is a common and good deployment pattern (test the tighter policy in report-only, then promote it), and it is worth being clear that the score will not move until the promotion happens.
 
-- A command-line interface:
-  ```bash
-  csp-index --url https://example.com
-  csp-index --header "script-src 'nonce-abc' 'strict-dynamic'"
-  csp-index --file headers.json
-  ```
+---
 
-- A JSON output mode for pipeline integration:
-  ```json
-  {
-    "index": 2.1,
-    "risk_level": "Low",
-    "category_scores": {
-      "script_execution": { "raw": 0.10, "adjusted": 0.10, "weight": 0.35 },
-      ...
-    },
-    "modifiers_applied": [],
-    "flags": ["style_src_no_nonce"]
-  }
-  ```
+## 11. Tooling
 
-### Integration with `csp-analysis`
+The reference implementation is not written yet. The intent is a Python library `csp_index` exposing a `compute_index()` call that takes the header string and a dict of other response headers, plus a CLI wrapping it:
 
-The `csp-analysis` project (a companion tool for large-scale CSP collection and classification) provides a complementary dataset of CSP adoption patterns across the web. The `csp_index` library is designed to be callable from `csp-analysis` pipelines, adding a risk index column to bulk CSP datasets for statistical analysis.
+```bash
+csp-index --url https://example.com
+csp-index --header "script-src 'nonce-VOSYT20SImp81YScafJexg==' 'strict-dynamic'"
+csp-index --file headers.json
+csp-index --url https://example.com --json --min-score 7.5 --model-version 0.2.0
+```
 
-### Suggested Use Cases
+JSON output carries `csp_score`, `rating`, `model_version`, the per-category breakdown with raw value, applied modifier and weight, the list of modifiers applied, and the flags from Section 5 (`report_only_present`, `sandboxed`, `weak_nonce`, `static_nonce`, and so on). The `--min-score` gate requires `--model-version` for the reason given in Section 8.
 
-- **CI/CD pipelines:** Assert that your application's CSP never regresses beyond a target index (e.g., `--max-index 3.5`).
-- **Security audits:** Provide clients with a reproducible, quantified CSP risk rating alongside remediation guidance.
-- **Research:** Score large CSP datasets to analyze industry-wide trends in CSP quality over time.
-- **Developer tooling:** IDE plugins, browser extensions, or HTTP proxy integrations that surface CSP risk index values in real time.
+The library is designed to be callable from [csp-lab](https://github.com/JGillam/csp-lab) pipelines, so that a bulk CSP dataset can get a score column and the classification work in `docs/csp-component-classifications.md` can be cross-referenced against it. That is the main reason determinism is a hard requirement: rescoring 750,000+ policies has to produce the same answers on Tuesday that it produced on Monday.
+
+Four uses I have in mind, roughly in order of how much I want them to exist: a CI gate that fails the build when a policy regresses below a pinned threshold, a reproducible number to put in a penetration test report next to the remediation guidance, bulk scoring for research on how CSP quality is actually trending, and developer tooling (an IDE plugin, a proxy extension) that shows the score while someone is editing the policy.
 
 ---
 
 ## 12. Limitations and Future Work
 
-### Known Limitations
+**Header-only analysis.** This scores a string. It does not know whether nonces are regenerated per request (beyond the two-fetch check in rule 8), whether the policy is served on every page or only the home page, or whether a service worker is rewriting things on the way out.
 
-**Header-only analysis.** This model scores the CSP header as a static string. It does not account for whether nonces are actually randomized per-request, whether allowlisted domains serve attacker-controllable content (a major practical weakness known as "CSP bypass via trusted CDN"), or whether the policy is actually enforced vs. report-only in practice.
+**No context sensitivity.** `form-action 'self'` scores 0.92 whether the site is a banking login or a recipe blog. Weighting risk by what the application actually does requires knowledge that is not in the header, and building it in would break determinism.
 
-**No context sensitivity.** A `form-action 'self'` score of 0.05 is the same regardless of whether the site handles authentication forms or purely informational content. Risk scoring in context requires application-level knowledge beyond the header.
+**Allowlist quality.** This is the biggest one. The rubric charges you for having an external host allowlist, but it cannot tell `script-src https://cdn.a-careful-partner.com` from `script-src https://a-cdn-that-hosts-user-uploads.example`, and in practice that difference is the whole ballgame. The Weichselbaum result mentioned in Section 6.1 is really a result about allowlist quality: roughly three quarters of distinct allowlist policies were bypassable, mostly through what the allowlist contained. Scoring this properly means maintaining a list of known-bypassable origins, which is a data maintenance problem, and it is the most valuable thing this project could add.
 
-**Allowlist quality.** The rubric penalizes any external-domain allowlist less than `'self'`-only policies, but it cannot distinguish between `script-src https://cdn.trusted-partner.com` and `script-src https://an-attacker-can-serve-content-here.com`. In practice, CDN-hosted script sources are a common CSP bypass vector; detecting this requires cross-referencing allowlisted domains against known-exploitable endpoints.
+**Dynamic policies.** Per-request generation, `<meta>` overrides (rule 9), and service-worker-managed policies are all outside header-level static analysis.
 
-**Dynamic policies.** Server-side rendering with per-request nonces, meta-tag CSP overrides, and ServiceWorker-managed policies are outside the scope of header-level static analysis.
+### Candidates for 0.3
 
-### Future Scoring Categories (v2 Candidates)
+`connect-src`, for post-XSS exfiltration paths, if I can find a framing that survives the argument in Section 4. `worker-src`, which is a small but growing isolation-bypass surface. A conditional weight for `base-uri` that rises when nonces are in use, per the open question in Section 4. Allowlist quality scoring against a maintained list of known-bypassable CDN origins. And a credit for Subresource Integrity used alongside an allowlist, since SRI is the one thing that actually hardens a CDN allowlist.
 
-- `connect-src`: Restricts outbound fetch/XHR/WebSocket connections. Relevant for data exfiltration post-XSS.
-- `worker-src`: Controls Web Worker and SharedWorker sources. Emerging attack surface for isolation bypasses.
-- `navigate-to`: Restricts navigation targets. Useful for containing open-redirect abuse.
-- Allowlist quality scoring: Penalize `script-src` allowlists that include known CDNs with user-uploadable content (e.g., domains that have been documented as CSP bypass vectors).
-- SRI correlation: Sites that use Subresource Integrity alongside CSP get additional risk reduction credit.
+### Calibration
 
-### Index Calibration
-
-The weights and rubric thresholds in this document are an initial proposal based on expert judgment and empirical analysis of CSP adoption data. They should be validated and potentially recalibrated against:
-
-- Known-exploited CSP configurations from public CVE databases
-- Expert consensus from the web security research community
-- Correlation analysis against real-world incident data
-
-Contributions to calibration methodology are welcome.
+Every weight, every rubric row, and every modifier percentage in this document is expert judgment. Mine, mostly, informed by what I see on tests and by the csp-lab dataset, but judgment all the same, and none of it has been validated against outcomes. What would make it better: correlation against known-exploited CSP configurations from public advisories, a serious look at whether the rubric rows rank real-world bypass difficulty in the right order, and enough people disagreeing with specific numbers in public that the numbers get defended or changed. If you have incident data that would help calibrate any of this, I would very much like to talk.
 
 ---
 
-## 13. References
+## 13. What Changed Since 0.1
 
-- [W3C Content Security Policy Level 3 Specification](https://www.w3.org/TR/CSP3/)
+Version 0.1 was a reasonable first pass that did not survive contact with the specification. Splitting the changes into two lists, because they deserve different amounts of argument.
+
+### Fixes to spec contradictions and undefined behavior
+
+1. `Content-Security-Policy-Report-Only` is now partitioned out and reported as a flag rather than being vaguely "treated as absent, though it may be noted separately" (rule 1).
+2. Multiple enforced policies are scored independently with a per-category minimum, replacing 0.1's "use the most restrictive effective value per directive," which is not a defined operation on source lists (rule 2).
+3. Duplicate directive names within one policy now resolve to the first occurrence, per CSP3 §2.2.1, which is the opposite of what a dictionary-based parser does by default (rule 3).
+4. Keyword matching is specified as whole-token, so `'wasm-unsafe-eval'` is no longer penalized as `'unsafe-eval'` (rule 4).
+5. Fallback chains now include `script-src-elem` / `script-src-attr` and `style-src-elem` / `style-src-attr`, scored as the worse of the two contexts, instead of 0.1's single "directive else `default-src`" step (rule 5).
+6. An enforced `sandbox` without `allow-scripts` now sets Script, Object and Style to 0.98; under 0.1 a fully sandboxed page with no other directives landed on that scale's worst possible result (rule 6).
+7. `'strict-dynamic'` with a valid nonce now discards host, scheme, `'self'` and `'unsafe-inline'` tokens before scoring, which fixes 0.1 scoring the spec's own recommended backward-compatible strict policy near the bottom of its script rubric because `https:` matched a wildcard row (rule 7).
+8. The script rubric is a base value plus deductions instead of a first-match tree, which gives `script-src 'none'` a defined result (it had none) and stops `'strict-dynamic'` plus a nonce plus `'unsafe-eval'` from being scored as though the `eval()` were the only thing in the directive (Section 6.1).
+9. Nonces must decode to at least 16 bytes to count, and `--url` mode fetches twice to catch static nonces; 0.1 accepted any string after the `'nonce-'` prefix, including its own example (rule 8).
+10. `'strict-dynamic'` without a nonce is now scored at 0.65 as a very restrictive misconfiguration, where 0.1 called it "meaningless" and gave it no matching row at all (Section 6.1).
+11. The `frame-ancestors` `'self'` row, which was unreachable in 0.1's first-match tree because the 1-2 entries row sat above it, is split into two reachable rows (Section 6.3).
+12. `X-Frame-Options` now applies only when no enforced policy contains `frame-ancestors`, replacing a gate that would have credited `frame-ancestors *` plus `X-Frame-Options: DENY` (Section 7).
+13. A modifier is now defined once, as an assignment of a protection value to the category, replacing 0.1's two conflicting definitions (a cap on maximum contribution in the prose, a proportional reduction in the formula) (Section 7).
+14. The `Permissions-Policy` modifier is deleted, because it has no relationship to CSS injection and its maximum effect of 0.045 points on 0.1's scale could never change a displayed score (Section 7).
+15. `require-trusted-types-for 'script'` closes a share of whatever exposure the script directive still has, instead of being a rubric row worth full credit, since it only covers DOM XSS sinks (Section 6.1).
+16. `navigate-to`, which 0.1 listed as a no-fallback control and as a v2 scoring candidate, is removed from this document entirely, since it was struck from CSP3 and no browser implements it (Section 4).
+17. The companion project is correctly named [csp-lab](https://github.com/JGillam/csp-lab); 0.1 called it "csp-analysis," which is not a repository that exists (Section 11).
+18. The JSON field `index` is renamed `csp_score`, `rating` and `model_version` are always emitted, and the CI gate `--min-score` now requires a pinned model version (Section 8).
+19. The claim that `script-src *; object-src *` is "arguably worse than no CSP" is dropped, since no defensible model can score it worse than absence; it is no better than no CSP, and the real harm is the false sense of security (Section 1).
+20. Frame Content is added as a seventh category, scoring `frame-src` through its real chain of `frame-src` to `child-src` to `default-src`; 0.1 scored `object-src` at 0.15 and did not score `frame-src` at all, which had the weights pointing at the dead attack and away from the live one (Sections 4 and 6.7).
+
+### Judgment calls you may want to argue with
+
+1. **The scale runs upward now.** 0.2 is a 0 to 10 score where higher is better, and 0.1 was a 1 to 10 index where lower was better. Every number quoted from 0.1 in this document is on that old scale. The reasoning: the posture scores people actually meet in the wild run higher-is-better (OpenSSF Scorecard's 0 to 10, Mozilla Observatory, Lighthouse, and the letter grades from SSL Labs and securityheaders.com), while CVSS runs the other way because it measures the severity of one vulnerability and its readers know that convention going in. This number describes the posture of a control, and it will be read by developers and managers who will never open this document. The tell was that an earlier draft of 0.2 needed a warning label in Section 8 explaining that lower was better; a scale that has to be captioned is pointing the wrong way. Better to do it now, before anyone implements against a score or depends on one.
+2. **The script cap.** `csp_score = 10 * min(weighted, p_script)` is the largest structural change in this version and the one most likely to be wrong in some edge case I have not thought of. It exists because 0.1 put a policy with no `script-src` and everything else perfect in the comfortable middle of its range with a reassuring label (Section 8).
+3. **Script weight 0.40, object weight 0.05.** Moving script up from 0.35 and object down from 0.15 is a claim about how much plugin content still matters in 2026. I think it is obviously right; I also thought 0.15 was fine six months ago (Section 4).
+4. **X-Frame-Options credited at 0.80 and 0.60**, where 0.1 allowed only 40% and 25% of the missing directive's value back. This follows from treating what is held back as deployment fragility, and reasonable people will land on different values (Section 7).
+5. **The allowlist rows**, specifically 0.50 for 1-2 origins, 0.40 for 3+, and the flat 0.10 credit for adding a nonce without `'strict-dynamic'`. The count thresholds are round numbers, not measurements (Section 6.1).
+6. **The 16-byte nonce cutoff.** CSP3 says SHOULD, not MUST, and treating a 12-byte nonce as no nonce at all is a sharp cliff for what is arguably still decent entropy (rule 8).
+7. **Trusted Types closing 25% and 35% of the remaining gap.** The gap between the two tiers is small and I am not certain the `trusted-types` allowlist directive earns a separate tier at all (Section 6.1).
+8. **Adding `frame-src` at 0.05 and paying for it out of the script weight.** Taking the 0.05 from script (0.45 down to 0.40) is defensible because the cap already governs any policy with a weak script directive, so the change is close to invisible where script is bad and small where script is good. The alternative was to shave the other five, which would have moved more numbers for less reason. Either way, every score computed under 0.1 or under an early draft of 0.2 is now a different number, which is the cost of a new category and the whole argument for `model_version` (Sections 4 and 8).
+
+---
+
+## 14. References
+
+- [W3C Content Security Policy Level 3](https://www.w3.org/TR/CSP3/)
 - [OWASP Content Security Policy Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Content_Security_Policy_Cheat_Sheet.html)
-- [Google CSP Evaluator](https://csp-evaluator.withgoogle.com/)
-- [Bypassing CSP with Policy Injection (PortSwigger Research)](https://portswigger.net/research/bypassing-csp-with-policy-injection)
 - [Mitigating XSS with a Strict Content Security Policy (Google)](https://csp.withgoogle.com/docs/strict-csp.html)
-- [CSP Is Dead, Long Live CSP! — Weichselbaum et al. (CCS 2016)](https://dl.acm.org/doi/10.1145/2976749.2978363)
-- MDN Web Docs: [Content-Security-Policy](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Security-Policy)
+- [Google CSP Evaluator](https://csp-evaluator.withgoogle.com/)
+- ["CSP Is Dead, Long Live CSP!" Weichselbaum, Spagnuolo, Lekies, Janc (CCS 2016)](https://dl.acm.org/doi/10.1145/2976749.2978363)
+- [Bypassing CSP with Policy Injection (PortSwigger Research)](https://portswigger.net/research/bypassing-csp-with-policy-injection)
+- [MDN: Content-Security-Policy](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Security-Policy)
+- [csp-lab: experimenting with gathering CSP data / statistics](https://github.com/JGillam/csp-lab)
+
+---
+
+The practical point of all this is small and specific: when you hand someone a CSP finding, you should be able to say "this policy scores 2.1, here are the three directives that put it there, and here is what it looks like after you fix them," instead of "you have a CSP but it is not very good."
+
+So please tear this apart. I want to know which rubric rows produce a number you disagree with, which of the judgment calls in Section 13 you think are wrong and why, and especially whether any real policy you score by hand comes out different from what this document says it should. Open an issue, and bring the header that broke it.
