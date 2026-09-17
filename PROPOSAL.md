@@ -120,6 +120,8 @@ This section is Layer 1, and it is where most of the work is. Before any rubric 
 
 **Rule 2. Multiple enforced policies are scored independently, then minimized per category.** Multiple `Content-Security-Policy` headers, or a comma-separated policy list inside one header value, produce multiple policies. CSP3 §8.1 says each is enforced independently and content must satisfy all of them, so the effective restriction is the strictest one. Score each policy on its own, then take the **per-category minimum** across policies. In 0.1 I said to use "the most restrictive value per directive," which sounds fine until you try to implement it: there is no defined way to intersect `script-src 'self' https://a.example` with `script-src 'nonce-...' 'strict-dynamic'`. Minimizing the *scores* is defined, and it is the closest honest approximation.
 
+**Order of operations:** minimize first, then finish. Take the per-category minimum across policies, and apply the Section 7 modifiers, the Trusted Types adjustment and the Section 8 script cap once, afterwards, to the minimized values. Scoring each policy end to end and then minimizing the finished numbers is a different calculation, and it is not the one this document means.
+
 **Rule 3. Within one policy, the first occurrence of a directive name wins.** If a policy contains `script-src 'self'; script-src *`, the effective value is `'self'` and the second one is ignored (CSP3 §2.2.1). This one matters because the obvious implementation gets it backwards: parse the policy into a dictionary with `directives[name] = value` and the *last* occurrence silently wins. That is also the basis of policy injection attacks, where an attacker who controls part of a reflected header appends a directive hoping to relax it. Under the spec they cannot relax an already-present directive, and the scorer needs to agree with the spec. (The PortSwigger policy injection technique works around this by adding a directive name that is *not* already present, e.g. `script-src-elem`, which is exactly why rule 5 resolves the `-elem` and `-attr` chains instead of stopping at `script-src`.)
 
 **Rule 4. Keyword matching is on whole quoted tokens, never substrings.** `'wasm-unsafe-eval'` contains the string `unsafe-eval` and is a completely different, much narrower keyword. A substring search penalizes it as though it were the real thing. Tokenize the source list on whitespace and compare whole tokens.
@@ -142,7 +144,11 @@ Script Execution is scored as the **worse (lower) of the two resolved values**, 
 
 The three no-fallback directives deserve their own sentence, because this is the single most common CSP misunderstanding I run into on tests: a strict `default-src` does not give you clickjacking protection, form hijacking protection, or `<base>` protection. Those three have to be written out explicitly or they are simply unset.
 
-**Rule 6. The `sandbox` directive is a precondition.** An enforced `sandbox` directive without `allow-scripts` means no script runs on that document at all, full stop, and Script, Object and Style are set to **0.98** regardless of what the source lists say. Without `allow-forms`, Form Actions is set to **0.98**. (I stopped short of 1.00 because sandbox is coarse enough that people get it wrong.) Set the `sandboxed` flag. Under 0.1's rubrics a fully sandboxed page with no other directives landed on that scale's worst possible result, which is about as wrong as this model can be.
+**Rule 6. The `sandbox` directive is a precondition.** An enforced `sandbox` directive without `allow-scripts` means no script runs on that document at all, full stop, and Script, Object and Style are **raised to at least 0.98**, whatever the source lists say. Without `allow-forms`, Form Actions is raised to at least 0.98. (I stopped short of 1.00 because sandbox is coarse enough that people get it wrong.)
+
+A floor and not an assignment, because an assignment would overwrite a category that has already earned more. `object-src 'none'` is worth 1.00 and it appears in every strict CSP recipe; `sandbox` only adds protection on top of it, so a rule that wrote 0.98 over that 1.00 would mean hardening a page lowered its score. That is the same inversion the origin-count tables in Section 6.3 are shaped to avoid, and it comes from the same place: a rule that sets a value without asking what was there. Set the `sandboxed` flag. Under 0.1's rubrics a fully sandboxed page with no other directives landed on that scale's worst possible result, which is about as wrong as this model can be.
+
+Frame Content is deliberately not elevated by this rule. Sandbox flags propagate into nested browsing contexts, so an injected iframe inherits the restriction -- but it still *renders*. The lookalike login overlay that Section 6.7 is about is still drawn on the page, and whether the user's keystrokes reach anyone depends on `allow-forms`. That is a partial mitigation of a partly-visual attack, and picking a single precondition value for it would claim more precision than I have. Flagged as an open question for 0.3.
 
 **Rule 7. The `'strict-dynamic'` keyword is a precondition, applied before scoring.** If the effective script directive contains `'strict-dynamic'` **and** a valid nonce or hash, then all host-source, scheme-source, `'self'` and `'unsafe-inline'` tokens are discarded from the list before any rubric row is considered (CSP3 §6.7.1.1 and §8.2). Browsers ignore them, so the scorer must too. This is not a hypothetical: the backward-compatible strict policy that the CSP3 spec and Google's own strict CSP guidance both recommend looks like `'nonce-...' 'strict-dynamic' 'unsafe-inline' https: http:`, and 0.1 scored it **0.95** because the `https:` token matched the wildcard row on the way down the first-match tree. The recommended policy scored almost as badly as no policy. That was the bug that convinced me 0.1 needed a structural fix rather than a tuning pass.
 
@@ -168,11 +174,21 @@ Every category returns a protection value `p` in [0.00, 1.00], where 1.00 means 
 
 One rule applies to all seven tables: **these are not first-match decision trees.** You pick the row that describes the trust model of the source list, and where more than one row genuinely describes it, you take the **lowest-scoring** row. This matters for lists like `'self' 'unsafe-inline' https:`, where both the scheme-source row and the active-`'unsafe-inline'` row apply and the answer is the lower of the two.
 
+That rule only produces an answer if *some* row applies. An earlier draft of this version had four tables where a legal source list matched no row at all, which is 0.1's unreachable-row failure wearing a different hat: either way the implementer is left to pick. Two supporting rules close it:
+
+**Every table below is exhaustive.** For each category, any effective source list matches at least one row. Where a table distinguishes counts of external origins, the rows cover 0, 1, 2 and 3-or-more, so there is no gap to fall into. An implementation that finds no applicable row has found a bug in this document, and should say so loudly rather than picking a value.
+
+**The `'none'` row is exclusive.** Exhaustiveness cuts both ways: `'none'` and an empty source list also have zero external origins, so on a count-keyed table they would match the zero-origin row as well, and the lowest-row rule would then quietly prefer 0.92 over the 1.00 that `'none'` has earned. When the `'none'` row applies, no other row does.
+
+**A keyword-only list is an empty list.** A source list containing no source expressions -- only keywords the rubric handles as deductions -- is scored as an empty source list. `script-src 'unsafe-eval'` blocks every script load and then permits `eval()` on what never loaded, so it scores as `'none'` (1.00) with the deduction applied (0.85). Reading it as "undefined" or as a bare `'unsafe-eval'` penalty gets a very restrictive directive badly wrong.
+
 ### 6.1 Script Execution
 
 The script rubric is a **base value plus deductions**, which is the other structural change in 0.2. The 0.1 version was a first-match tree, and it had two problems I could not tune my way out of. First, it had no row for `script-src 'none'`, so the correct answer for the most restrictive possible value was undefined and fell through to whatever the implementer felt like. Second, because the tree matched on one condition and stopped, `'strict-dynamic' 'nonce-...' 'unsafe-eval'` matched the "`'unsafe-eval'` only" row and landed at **0.55**, scoring a strict nonce policy with one legacy `eval()` dependency worse than a plain `'self'` allowlist. Separating the trust model from the specific relaxations fixes both.
 
 **Step 1.** Pick the one base-value row that describes the trust model of the effective source list, after rules 6 through 8 have been applied. If two rows describe it (e.g. `'self' 'unsafe-inline' https:` is both a scheme-source list and an active-`'unsafe-inline'` list), take the lower one. IMPORTANT: an implementation that walks the table top to bottom and stops at the first hit will get this wrong, and Example C shows exactly where.
+
+The four tokens Step 2 handles as deductions -- `'unsafe-eval'`, `'unsafe-hashes'`, `'wasm-unsafe-eval'` and `blob:` -- take no part in choosing the base row. Strip them first, so nothing is charged for twice. This is why `blob:` does not appear in the scheme-source row, and it settles `script-src blob:`: stripping `blob:` leaves an empty list, so the base is 1.00 and the deduction brings it to 0.90. That is the right answer. Minting a blob URL takes script that is already running, so a directive allowing only `blob:` loads nothing an attacker can reach without already having won.
 
 | Effective source list | Base `p` |
 |---|---|
@@ -223,8 +239,8 @@ Rows unchanged from 0.1 in substance; only the category weight moved and the dir
 
 | Effective source list | `p` |
 |---|---|
-| `'none'` | 1.00 |
-| `'self'` only | 0.85 |
+| `'none'`, or an empty source list | 1.00 |
+| `'self'` only (no external origins) | 0.85 |
 | External host allowlist | 0.65 |
 | `data:` | 0.25 |
 | Wildcard `*` or a scheme source | 0.10 |
@@ -236,15 +252,17 @@ Evaluate `frame-ancestors`. No fallback.
 
 | Effective source list | `p` |
 |---|---|
-| `'none'` | 1.00 |
-| `'self'` only | 0.92 |
-| `'self'` plus exactly one external origin | 0.80 |
-| 1-2 external origins (no `'self'`) | 0.70 |
-| 3+ external origins | 0.50 |
-| `*` | 0.10 |
+| `'none'`, or an empty source list | 1.00 |
+| No external origins | 0.92 |
+| Exactly 1 external origin (with or without `'self'`) | 0.80 |
+| Exactly 2 external origins (with or without `'self'`) | 0.70 |
+| 3 or more external origins (with or without `'self'`) | 0.50 |
+| `*`, or a scheme source | 0.10 |
 | Directive absent | 0.00 |
 
-0.1 had a row reading "`'self'` (possibly with one trusted origin)" scored at 0.10, sitting *below* the 1-2 entries row in a first-match tree, which made it unreachable for anything but bare `'self'`. Splitting it into two explicit rows fixes that and puts a real, small cost on the partner origin you added for the support widget.
+**Count the external origins; `'self'` is not one of them.** Worth spelling out, because the same shape repeats in Sections 6.4 and 6.7. 0.1 had a row reading "`'self'` (possibly with one trusted origin)" scored at 0.10, sitting *below* the 1-2 entries row in a first-match tree, which made it unreachable for anything but bare `'self'`. The obvious repair is to key the rows on whether `'self'` is present, and that breaks two ways: `frame-ancestors 'self' https://a.example https://b.example` then matches no row at all, and `frame-ancestors https://partner.example` scores *below* `frame-ancestors 'self' https://partner.example`, which allows strictly more. Adding an origin would raise the score.
+
+Counting external origins and ignoring `'self'` avoids both. `'self'` is your own origin; it is never the party that framed you, and whether you also list it changes nothing about who else can. Each additional party you let frame the page does.
 
 ### 6.4 Form Actions
 
@@ -252,12 +270,12 @@ Evaluate `form-action`. No fallback. Same shape as frame embedding, because the 
 
 | Effective source list | `p` |
 |---|---|
-| `'none'` | 1.00 |
-| `'self'` only | 0.92 |
-| `'self'` plus exactly one external origin | 0.80 |
-| 1-2 external origins (no `'self'`) | 0.70 |
-| 3+ external origins | 0.50 |
-| `*` | 0.10 |
+| `'none'`, or an empty source list | 1.00 |
+| No external origins | 0.92 |
+| Exactly 1 external origin (with or without `'self'`) | 0.80 |
+| Exactly 2 external origins (with or without `'self'`) | 0.70 |
+| 3 or more external origins (with or without `'self'`) | 0.50 |
+| `*`, or a scheme source | 0.10 |
 | Directive absent | 0.00 |
 
 ### 6.5 Base URI
@@ -266,13 +284,13 @@ Evaluate `base-uri`. No fallback.
 
 | Effective source list | `p` |
 |---|---|
-| `'none'` | 1.00 |
-| `'self'` | 0.92 |
-| External host allowlist | 0.60 |
-| `*` | 0.10 |
+| `'none'`, or an empty source list | 1.00 |
+| No external origins | 0.92 |
+| 1 or more external origins (with or without `'self'`) | 0.60 |
+| `*`, or a scheme source | 0.10 |
 | Directive absent | 0.00 |
 
-There is almost never a legitimate reason to allow an external origin here, which is why the drop from 0.92 to 0.60 is so steep. See the open question about conditional weighting in Section 4.
+There is almost never a legitimate reason to allow an external origin here, which is why the drop from 0.92 to 0.60 is so steep, and why this table does not bother counting past one. A scheme source belongs with `*` here, because a `<base>` tag pointing anywhere on the HTTPS internet is the whole attack. See the open question about conditional weighting in Section 4.
 
 ### 6.6 Style Injection
 
@@ -280,9 +298,9 @@ Evaluate the style chain from rule 5, worse of element and attribute contexts. T
 
 | Effective source list | `p` |
 |---|---|
-| `'none'` | 1.00 |
-| Valid nonce or hash, no host sources, no active `'unsafe-inline'` | 0.95 |
-| `'self'` only | 0.90 |
+| `'none'`, or an empty source list | 1.00 |
+| Valid nonce or hash, no host or scheme sources, no active `'unsafe-inline'` | 0.95 |
+| `'self'` only (no nonce or hash, no external origins) | 0.90 |
 | External host allowlist, no active `'unsafe-inline'` | 0.65 |
 | Active `'unsafe-inline'` | 0.35 |
 | Wildcard `*` or a scheme source | 0.10 |
@@ -298,11 +316,11 @@ Evaluate `frame-src`, falling back to `child-src` and then `default-src` per rul
 
 | Effective source list | `p` |
 |---|---|
-| `'none'` | 1.00 |
-| `'self'` only | 0.90 |
-| `'self'` plus exactly one external origin | 0.80 |
-| 1-2 external origins (no `'self'`) | 0.70 |
-| 3+ external origins | 0.50 |
+| `'none'`, or an empty source list | 1.00 |
+| No external origins | 0.90 |
+| Exactly 1 external origin (with or without `'self'`) | 0.80 |
+| Exactly 2 external origins (with or without `'self'`) | 0.70 |
+| 3 or more external origins (with or without `'self'`) | 0.50 |
 | `data:` | 0.25 |
 | Wildcard `*` or a scheme source | 0.10 |
 | Directive absent | 0.00 |
@@ -533,7 +551,7 @@ Most of what was in this section in 0.1 became actual resolution rules in Sectio
 
 ## 11. Tooling
 
-The reference implementation is not written yet. The intent is a Python library `csp_index` exposing a `compute_index()` call that takes the header string and a dict of other response headers, plus a CLI wrapping it:
+The reference implementation is not written yet. The intent is a Python library `csp_index` exposing a `compute_score()` call that takes the header string and a dict of other response headers, plus a CLI wrapping it:
 
 ```bash
 csp-index --url https://example.com
@@ -581,21 +599,22 @@ Version 0.1 was a reasonable first pass that did not survive contact with the sp
 3. Duplicate directive names within one policy now resolve to the first occurrence, per CSP3 §2.2.1, which is the opposite of what a dictionary-based parser does by default (rule 3).
 4. Keyword matching is specified as whole-token, so `'wasm-unsafe-eval'` is no longer penalized as `'unsafe-eval'` (rule 4).
 5. Fallback chains now include `script-src-elem` / `script-src-attr` and `style-src-elem` / `style-src-attr`, scored as the worse of the two contexts, instead of 0.1's single "directive else `default-src`" step (rule 5).
-6. An enforced `sandbox` without `allow-scripts` now sets Script, Object and Style to 0.98; under 0.1 a fully sandboxed page with no other directives landed on that scale's worst possible result (rule 6).
+6. An enforced `sandbox` without `allow-scripts` now raises Script, Object and Style to at least 0.98; under 0.1 a fully sandboxed page with no other directives landed on that scale's worst possible result (rule 6).
 7. `'strict-dynamic'` with a valid nonce now discards host, scheme, `'self'` and `'unsafe-inline'` tokens before scoring, which fixes 0.1 scoring the spec's own recommended backward-compatible strict policy near the bottom of its script rubric because `https:` matched a wildcard row (rule 7).
-8. The script rubric is a base value plus deductions instead of a first-match tree, which gives `script-src 'none'` a defined result (it had none) and stops `'strict-dynamic'` plus a nonce plus `'unsafe-eval'` from being scored as though the `eval()` were the only thing in the directive (Section 6.1).
+8. The script rubric is a base value plus deductions instead of a first-match tree, which gives `script-src 'none'` a defined result (it had none) and stops `'strict-dynamic'` plus a nonce plus `'unsafe-eval'` from being scored as though the `eval()` were the only thing in the directive. The deduction tokens take no part in choosing the base row, so nothing is charged for twice (Section 6.1).
 9. Nonces must decode to at least 16 bytes to count, and `--url` mode fetches twice to catch static nonces; 0.1 accepted any string after the `'nonce-'` prefix, including its own example (rule 8).
 10. `'strict-dynamic'` without a nonce is now scored at 0.65 as a very restrictive misconfiguration, where 0.1 called it "meaningless" and gave it no matching row at all (Section 6.1).
-11. The `frame-ancestors` `'self'` row, which was unreachable in 0.1's first-match tree because the 1-2 entries row sat above it, is split into two reachable rows (Section 6.3).
+11. The `frame-ancestors` `'self'` row, which was unreachable in 0.1's first-match tree because the 1-2 entries row sat above it, is gone; Frame Embedding, Form Actions and Frame Content are now keyed on the external origin count alone, with `'self'` not counted, which makes those tables exhaustive and stops a strictly more restrictive policy from scoring below a looser one (Sections 6.3, 6.4, 6.7).
 12. `X-Frame-Options` now applies only when no enforced policy contains `frame-ancestors`, replacing a gate that would have credited `frame-ancestors *` plus `X-Frame-Options: DENY` (Section 7).
 13. A modifier is now defined once, as an assignment of a protection value to the category, replacing 0.1's two conflicting definitions (a cap on maximum contribution in the prose, a proportional reduction in the formula) (Section 7).
 14. The `Permissions-Policy` modifier is deleted, because it has no relationship to CSS injection and its maximum effect of 0.045 points on 0.1's scale could never change a displayed score (Section 7).
 15. `require-trusted-types-for 'script'` closes a share of whatever exposure the script directive still has, instead of being a rubric row worth full credit, since it only covers DOM XSS sinks (Section 6.1).
 16. `navigate-to`, which 0.1 listed as a no-fallback control and as a v2 scoring candidate, is removed from this document entirely, since it was struck from CSP3 and no browser implements it (Section 4).
 17. The companion project is correctly named [csp-lab](https://github.com/JGillam/csp-lab); 0.1 called it "csp-analysis," which is not a repository that exists (Section 11).
-18. The JSON field `index` is renamed `csp_score`, `rating` and `model_version` are always emitted, and the CI gate `--min-score` now requires a pinned model version (Section 8).
-19. The claim that `script-src *; object-src *` is "arguably worse than no CSP" is dropped, since no defensible model can score it worse than absence; it is no better than no CSP, and the real harm is the false sense of security (Section 1).
-20. Frame Content is added as a seventh category, scoring `frame-src` through its real chain of `frame-src` to `child-src` to `default-src`; 0.1 scored `object-src` at 0.15 and did not score `frame-src` at all, which had the weights pointing at the dead attack and away from the live one (Sections 4 and 6.7).
+18. Every rubric table is exhaustive: a keyword-only source list scores as an empty one, every `'none'` row covers the empty list, `base-uri` gained the scheme-source row the other tables already had, and rule 2 states its order of operations. 0.1's first-match trees left several legal source lists undefined, and "take the lowest applicable row" is only a rule if a row always applies (Sections 5 and 6).
+19. The JSON field `index` is renamed `csp_score`, `rating` and `model_version` are always emitted, and the CI gate `--min-score` now requires a pinned model version (Section 8).
+20. The claim that `script-src *; object-src *` is "arguably worse than no CSP" is dropped, since no defensible model can score it worse than absence; it is no better than no CSP, and the real harm is the false sense of security (Section 1).
+21. Frame Content is added as a seventh category, scoring `frame-src` through its real chain of `frame-src` to `child-src` to `default-src`; 0.1 scored `object-src` at 0.15 and did not score `frame-src` at all, which had the weights pointing at the dead attack and away from the live one (Sections 4 and 6.7).
 
 ### Judgment calls you may want to argue with
 
