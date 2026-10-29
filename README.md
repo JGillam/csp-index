@@ -10,7 +10,7 @@ Everything (the categories and weights, the resolution rules, the per-category r
 
 ## Status
 
-RFC, version 0.2.0. There is no reference implementation yet, deliberately: I want to argue about the model in public before anyone codes against it. Version 0.2 is a substantial correction of 0.1, mostly in places where 0.1 contradicted the CSP Level 3 spec, and there is a section at the end of the proposal listing exactly what changed and which changes are judgment calls.
+RFC, version 0.2.0. There is now a reference implementation: the calculator at [mechanicaldrake.com/lab/csp-index](https://mechanicaldrake.com/lab/csp-index) scores a policy using the rules in `PROPOSAL.md`, and it runs entirely in your browser, so the policy you paste never leaves your machine. The model is still open for argument, which is why it lives here as an RFC. Version 0.2 is a substantial correction of 0.1, mostly in places where 0.1 contradicted the CSP Level 3 spec, and there is a section at the end of the proposal listing exactly what changed and which changes are judgment calls.
 
 ## Feedback
 
